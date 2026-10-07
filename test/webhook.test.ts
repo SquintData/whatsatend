@@ -102,3 +102,31 @@ test('nullable recipient on incoming messages preserves history and deduplicatio
     assert.equal((await f.pg.query('SELECT * FROM messages')).rows.length, 1);
   } finally { await f.close(); }
 });
+
+test('GOWS app-sent message without to pauses the destination conversation', async () => {
+  const f = await fixture();
+  try {
+    const customer = '111111111111@lid';
+    const ownAccount = '222222222222@lid';
+    const incoming = { ...f.event(), payload: { ...f.event().payload, from: customer, to: null } };
+    assert.equal((await f.send(incoming)).json().status, 'stored');
+    const outgoing = {
+      ...f.event(),
+      payload: {
+        ...f.event().payload, id: 'outgoing-gows', fromMe: true, from: ownAccount, to: null,
+        source: 'app', _data: { Info: { Chat: customer, Sender: ownAccount, IsFromMe: true } },
+      },
+    };
+    assert.equal((await f.send(outgoing)).json().status, 'stored');
+    assert.equal((await f.send(outgoing)).json().status, 'duplicate');
+    const conversations = await f.pg.query<{ chat_id: string; mode: string }>('SELECT chat_id, mode FROM conversations');
+    assert.deepEqual(conversations.rows, [{ chat_id: customer, mode: 'human' }]);
+    const messages = await f.pg.query<{ direction: string }>('SELECT direction FROM messages ORDER BY direction');
+    assert.deepEqual(messages.rows, [{ direction: 'incoming' }, { direction: 'outgoing' }]);
+    const invalid = { ...outgoing, payload: { ...outgoing.payload, id: 'bad-gows', _data: { Info: { Chat: 123, Sender: customer } } } };
+    assert.equal((await f.send(invalid)).json().error, 'missing_recipient');
+    const group = { ...outgoing, payload: { ...outgoing.payload, id: 'group-gows', _data: { Info: { Chat: '123@g.us' } } } };
+    assert.equal((await f.send(group)).json().status, 'ignored_chat');
+    assert.equal((await f.pg.query('SELECT * FROM messages')).rows.length, 2);
+  } finally { await f.close(); }
+});
