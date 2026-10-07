@@ -7,7 +7,7 @@ const envelopeSchema = z.object({
 });
 const messageSchema = z.object({
   id: z.string().min(1).max(512), from: z.string().min(1).max(255),
-  to: z.string().min(1).max(255).optional(), fromMe: z.boolean(),
+  to: z.string().min(1).max(255).nullish().transform(value => value ?? undefined), fromMe: z.boolean(),
   body: z.string().max(16000).optional().default(''),
   timestamp: z.number().int().nonnegative().safe().optional(),
 });
