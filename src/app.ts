@@ -10,7 +10,9 @@ const messageSchema = z.object({
   to: z.string().min(1).max(255).nullish().transform(value => value ?? undefined), fromMe: z.boolean(),
   body: z.string().max(16000).optional().default(''),
   timestamp: z.number().int().nonnegative().safe().optional(),
+  _data: z.unknown().optional(),
 });
+const gowsChatSchema = z.object({ Info: z.object({ Chat: z.string().min(1).max(255) }) });
 const directChat = (id: string) => /^\d+(?:@c\.us|@s\.whatsapp\.net|@lid)$/.test(id);
 
 export function buildApp(store: Store, logger = false) {
@@ -49,7 +51,13 @@ export function buildApp(store: Store, logger = false) {
       request.log.warn({ reason: 'invalid_message', issues: parsed.error.issues.map(issue => ({ field: issue.path[0], code: issue.code })) }, 'WAHA webhook rejected');
       return reply.code(400).send({ error: 'invalid_message' });
     }
-    const message = parsed.data;
+    const { _data, ...message } = parsed.data;
+    if (message.fromMe && !message.to) {
+      // GOWS app-sent messages can omit `to`; Info.Chat identifies the conversation.
+      // Never substitute Info.Sender or `from`, which may identify our own account.
+      const gowsChat = gowsChatSchema.safeParse(_data);
+      if (gowsChat.success) message.to = gowsChat.data.Info.Chat;
+    }
     if (message.fromMe && !message.to) {
       request.log.warn({ reason: 'missing_recipient' }, 'WAHA webhook rejected');
       return reply.code(400).send({ error: 'missing_recipient' });
