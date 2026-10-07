@@ -25,6 +25,7 @@ export function buildApp(store: Store, logger = false) {
     const code = error && typeof error === 'object' && 'statusCode' in error ? error.statusCode : undefined;
     const status = typeof code === 'number' && code >= 400 && code < 500 ? code : 503;
     if (status === 503) request.log.error({ requestId: request.id }, 'Request failed; payload omitted');
+    else request.log.warn({ requestId: request.id, status }, 'HTTP request rejected; payload omitted');
     reply.code(status).send({ error: status === 503 ? 'service_unavailable' : 'invalid_request' });
   });
   app.get('/health/live', async () => ({ status: 'ok' }));
@@ -36,14 +37,23 @@ export function buildApp(store: Store, logger = false) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
     const envelope = envelopeSchema.safeParse(request.body);
-    if (!envelope.success) return reply.code(400).send({ error: 'invalid_event' });
+    if (!envelope.success) {
+      request.log.warn({ reason: 'invalid_event', issues: envelope.error.issues.map(issue => ({ field: issue.path[0], code: issue.code })) }, 'WAHA webhook rejected');
+      return reply.code(400).send({ error: 'invalid_event' });
+    }
     const channel = await store.authenticate(request.params.instance, envelope.data.session, token);
     if (!channel) return reply.code(401).send({ error: 'unauthorized' });
     if (envelope.data.event !== 'message.any') return reply.code(202).send({ status: 'ignored_event' });
     const parsed = messageSchema.safeParse(envelope.data.payload);
-    if (!parsed.success) return reply.code(400).send({ error: 'invalid_message' });
+    if (!parsed.success) {
+      request.log.warn({ reason: 'invalid_message', issues: parsed.error.issues.map(issue => ({ field: issue.path[0], code: issue.code })) }, 'WAHA webhook rejected');
+      return reply.code(400).send({ error: 'invalid_message' });
+    }
     const message = parsed.data;
-    if (message.fromMe && !message.to) return reply.code(400).send({ error: 'missing_recipient' });
+    if (message.fromMe && !message.to) {
+      request.log.warn({ reason: 'missing_recipient' }, 'WAHA webhook rejected');
+      return reply.code(400).send({ error: 'missing_recipient' });
+    }
     const chatId = message.fromMe ? message.to! : message.from;
     if (!directChat(chatId)) return reply.code(202).send({ status: 'ignored_chat' });
     const inserted = await store.receive(channel, message);
