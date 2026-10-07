@@ -85,3 +85,20 @@ test('storage failure returns retryable error without exposing database details'
     assert.equal((await f.pg.query('SELECT * FROM conversations')).rows.length, 0);
   } finally { await f.close(); }
 });
+
+test('nullable recipient on incoming messages preserves history and deduplication', async () => {
+  const f = await fixture();
+  try {
+    const event = { ...f.event(), payload: { ...f.event().payload, to: null } };
+    assert.equal((await f.send(event)).json().status, 'stored');
+    assert.equal((await f.send(event)).json().status, 'duplicate');
+    const history = await f.pg.query<{ direction: string; chat_id: string }>(
+      'SELECT m.direction, c.chat_id FROM messages m JOIN conversations c ON c.id = m.conversation_id',
+    );
+    assert.deepEqual(history.rows, [{ direction: 'incoming', chat_id: event.payload.from }]);
+    assert.equal((await f.send({ ...event, payload: { ...event.payload, id: 'outgoing-null', fromMe: true } })).json().error, 'missing_recipient');
+    assert.equal((await f.send({ ...event, payload: { ...event.payload, to: 123 } })).statusCode, 400);
+    assert.equal((await f.send({ ...event, payload: { ...event.payload, to: {} } })).statusCode, 400);
+    assert.equal((await f.pg.query('SELECT * FROM messages')).rows.length, 1);
+  } finally { await f.close(); }
+});
