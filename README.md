@@ -1,32 +1,34 @@
 # WhatsAtend
 
-Plataforma interna para operar atendimento de várias empresas no WhatsApp.
-Base em Node.js/TypeScript, Fastify, PostgreSQL e WAHA/GOWS.
+Plataforma interna para atendimento de várias empresas no WhatsApp.
+Node.js 22+, TypeScript, Fastify, PostgreSQL e WAHA/GOWS.
 
-## Esta entrega
+## Estado atual
 
-- API com verificações de saúde e webhook autenticado por canal.
-- Cadastro inicial de empresa e vínculo com instância/sessão da WAHA via comando.
-- Mensagens de conversas individuais armazenadas por empresa.
-- Deduplicação por canal e ID da mensagem; operações transacionais.
-- Eventos enviados (`fromMe`) colocam a conversa em modo humano.
-- Dockerfile para Easypanel, usuário sem privilégios e nenhuma credencial no código.
+- Webhook autenticado por canal; histórico e deduplicação por empresa/sessão.
+- Conversas individuais; identificação GOWS por `_data.Info.Chat`, inclusive quando `to` é null.
+- Resposta fixa de teste com fila persistente no PostgreSQL.
+- Envio desativado por padrão; limitado a uma instância, sessão e identificador de contato.
+- Conversas começam em `monitoring`. Retomada explícita muda para `auto`.
+- Resposta manual muda para `human` e cancela os envios pendentes da conversa.
+- IDs retornados pela API identificam respostas próprias, que não ativam modo humano.
+- Sem IA, painel administrativo, campanhas ou envio de mídia nesta etapa.
 
-**Esta versão apenas recebe e registra mensagens. Não envia respostas, não chama IA
-e não tem painel administrativo.** Não conectar números de clientes ainda.
-Antes de habilitar envio, correlacionar respostas do backend com seus IDs na WAHA:
-`fromMe` também aparece nas mensagens enviadas pela API, não apenas pelo funcionário.
+A resposta fixa é: “Olá! Recebemos sua mensagem. Este é um teste do atendimento automático.”
+Não ativar esta versão para clientes: o envio foi limitado ao piloto autorizado.
 
 ## Desenvolvimento
 
-Requer Node.js 22+ e PostgreSQL. Use um banco exclusivo da aplicação.
+Use PostgreSQL exclusivo da aplicação. Gere um `WEBHOOK_TOKEN` diferente por canal
+com `openssl rand -hex 32`. Não confundir com `WAHA_API_KEY`.
 
 ```bash
 npm ci
 cp .env.example .env
 ```
 
-Edite `.env` com valores locais. Os comandos não carregam esse arquivo implicitamente:
+Edite `.env`, mantendo `AUTO_REPLY_ENABLED=false`. Os scripts não carregam esse
+arquivo implicitamente; use:
 
 ```bash
 node --env-file=.env --import tsx src/migrate.ts
@@ -34,91 +36,166 @@ node --env-file=.env --import tsx src/provision.ts
 node --env-file=.env --import tsx src/server.ts
 ```
 
-Gere `WEBHOOK_TOKEN` com `openssl rand -hex 32`. É um segredo novo por canal,
-diferente de `WAHA_API_KEY`, da senha do dashboard e da senha do banco.
-`WAHA_INSTANCE=principal` identifica nossa instalação da WAHA; `WAHA_SESSION=teste`
-deve corresponder exatamente ao nome cadastrado no dashboard.
-O comando provision é repetível para a mesma sessão e token e recusa substituir
-silenciosamente um vínculo existente. O token é guardado no banco apenas como SHA-256.
-
 ```bash
 npm run check
 npm test
 npm run build
 ```
 
-Os testes usam PostgreSQL embarcado via PGlite, sem credenciais ou rede.
-Validam autenticação, isolamento entre empresas, deduplicação, modo humano,
-entrada inválida e rollback. A integração real com WAHA será testada na VPS.
+Testes usam PostgreSQL embarcado via PGlite e uma API WAHA simulada. Verificam
+autenticação, isolamento, deduplicação, GOWS, fila persistente, resposta própria,
+pausa humana, retomada, cancelamento, timeout e falha de gravação depois do envio.
+Concorrência real e envio pelo WhatsApp devem ser validados na VPS.
 
-## Easypanel
+## Instalação inicial no Easypanel
 
-1. Criar serviço PostgreSQL no projeto `atendimento`, sem porta pública nem domínio.
-   Usar senha aleatória, volume persistente e backups fora da VPS.
-2. Criar App `backend` ligado ao repositório privado, selecionando a branch que contém
-   esta entrega. Build pelo `Dockerfile` na raiz; não usar buildpack.
-3. Em Ambiente, configurar `DATABASE_URL` com a conexão **interna** fornecida pelo
-   Easypanel e `PORT=3000`. Não reutilizar o banco da WAHA ou do Easypanel.
-   Para provisionamento adicionar `COMPANY_NAME`, `WAHA_INSTANCE`, `WAHA_SESSION`
-   e `WEBHOOK_TOKEN`, conforme `.env.example`.
-4. Antes do primeiro início, executar uma tarefa de migração com essa mesma imagem
-   e ambiente: `node dist/migrate.js`. Executar depois `node dist/provision.js`.
-   Se a interface não oferecer tarefa avulsa, temporariamente trocar o comando de
-   inicialização pelo comando de migração e, após sucesso confirmado nos logs,
-   pelo de provisionamento. Finalmente restaurar `node dist/server.js` e implantar.
-   Não executar os comandos one-shot como um serviço permanente.
-5. Verificar `/health/ready`. Não publicar a porta interna 3000 no IP da VPS.
-6. Para o webhook, preferir o endereço interno do backend acessível pelo contêiner
-   WAHA. Usar o hostname fornecido pelo Easypanel e confirmar a comunicação entre
-   serviços; não presumir que `localhost` ou o IP do Tailscale aponta para o backend.
-   A rota é `/webhooks/waha/principal`.
-7. Na sessão `teste` da WAHA, configurar evento **`message.any`** e cabeçalho
-   `X-Webhook-Token` com o segredo desse canal. Se a interface não permitir
-   cabeçalhos personalizados, conferir a configuração REST dessa versão antes
-   de ativar: **não colocar o token na URL nem desabilitar a autenticação**.
-8. Configurar tentativas de reenvio para falhas de rede/5xx segundo a versão WAHA.
-   Responder 200 só após commit; evento repetido retorna `duplicate`.
+1. Criar PostgreSQL persistente no projeto `atendimento`, sem domínio/porta pública.
+2. Criar App `backend` pelo repositório privado, com `Dockerfile` na raiz.
+3. Configurar `DATABASE_URL` com conexão interna e `PORT=3000`. Nunca colocar senhas
+   no GitHub, em capturas ou em logs. A senha na URL deve ser codificada para URL.
+4. Para o cadastro inicial configurar `COMPANY_NAME`, `WAHA_INSTANCE=principal`,
+   `WAHA_SESSION=teste` e `WEBHOOK_TOKEN` com 64 caracteres hexadecimais aleatórios.
+5. Executar migração e provisionamento uma vez antes do servidor. No campo Command:
 
-Um domínio HTTPS do backend é opcional quando WAHA e backend se comunicam pela
-rede interna. Se for publicado, usar DNS correto, caminho externo `/`, destino
-HTTP porta 3000 e caminho `/`; webhook permanece autenticado.
-
-## Validação na VPS
-
-- Sem token: webhook deve responder 401.
-- Token incorreto ou sessão de outra empresa: 401.
-- Mensagem externa: registrar uma entrada `incoming`.
-- Repetição do evento: nenhuma mensagem adicional.
-- Resposta pelo celular: registrar `outgoing` e conversa em `human`.
-- Grupos/status/canais: ignorados nesta entrega.
-- Reinício do backend: histórico preservado no PostgreSQL.
-
-Consulta de conferência pelo console SQL do banco:
-
-```sql
-SELECT o.name, c.session, m.direction, m.received_at
-FROM messages m
-JOIN organizations o ON o.id = m.organization_id
-JOIN channels c ON c.id = m.channel_id
-ORDER BY m.received_at DESC LIMIT 20;
+```sh
+sh -c 'node dist/migrate.js && node dist/provision.js && exec node dist/server.js'
 ```
 
-## Limites e próximas entregas
+Após sucesso, trocar para `node dist/server.js`. O provisionamento não substitui
+silenciosamente o vínculo ou segredo de uma sessão existente.
 
-Não existe garantia de entrega exatamente uma vez ao enviar ao WhatsApp: falhas
-de rede podem deixar o resultado de envio indeterminado. A próxima entrega deverá
-introduzir fila persistente, estado de envio, identificação das mensagens próprias,
-retentativas controladas e retomada explícita após atendimento humano.
-Depois entram resposta fixa em teste, IA com dados publicados da empresa e consumo.
+Na WAHA configurar a sessão para evento `message.any`, webhook interno
+`http://atendimento-backend:3000/webhooks/waha/principal` e cabeçalho
+`X-Webhook-Token` com o segredo cadastrado. Confirmar que esse hostname resolve
+na rede do Easypanel; não usar hostname com underscore na URL validada pela WAHA.
+Configurar reenvio de falhas de rede/5xx segundo a versão instalada.
 
-Nesta versão a conta do banco executa migrações e queries do backend. Antes de produção,
-separar o usuário de migração do usuário de aplicação, limitar privilégios,
-definir retenção de mensagens e testar restauração dos backups.
-Não há endpoints públicos de consulta de dados nem autenticação de operadores ainda.
-O isolamento é aplicado pelo vínculo autenticado e por chaves estrangeiras compostas;
-não se afirma que há RLS ou proteção contra consultas arbitrárias de um operador do banco.
+Nenhuma porta pública ou domínio adicional é necessário para o backend ou banco.
+Administração via Tailscale; WAHA exige chave de API e senha no dashboard.
 
-Não registrar corpo de mensagens, cabeçalhos secretos ou credenciais nos logs.
-Manter administração via Tailscale e firewall externo aplicado à VPS.
-Depois de validar, fixar também versão/digest da WAHA; evitar atualizações automáticas
-de `latest` na operação comercial.
+## Atualização da instalação existente
+
+A migração `002_fixed_reply.sql` adiciona modo `auto`, geração de automação e fila.
+Não remove empresas ou histórico. O runner cria um registro de migrações e aplica
+arquivos novos uma vez, dentro de transação e lock de migração.
+Uma instalação antiga sem registro reaplica `001` de modo idempotente.
+
+1. Fazer backup do PostgreSQL antes de atualizar o schema.
+2. Manter `AUTO_REPLY_ENABLED=false` e implantar a branch com esta entrega.
+3. Temporariamente usar o Command:
+
+```sh
+sh -c 'node dist/migrate.js && exec node dist/server.js'
+```
+
+4. Confirmar `Database migrations ready` e servidor iniciado. Restaurar Command
+   `node dist/server.js`. Não executar provisionamento novamente.
+5. Confirmar comunicação do backend com WAHA e a saúde do banco antes de ativar.
+
+## Ativação da resposta fixa
+
+Primeiro identificar a conversa do contato de teste no PostgreSQL:
+
+```sql
+SELECT cv.chat_id, cv.mode, c.instance, c.session
+FROM conversations cv JOIN channels c ON c.id = cv.channel_id
+WHERE c.instance = 'principal' AND c.session = 'teste';
+```
+
+Com GOWS, o identificador pode terminar em `@lid`. Use o ID exato informado
+em `Info.Chat` e confirme que corresponde ao contato autorizado, não ao número
+da empresa. Não enviar o identificador ao chat de suporte se não for necessário.
+Eventos novos usam `Info.Chat` consistentemente; registros antigos em forma
+de telefone podem permanecer em uma conversa separada. Esta entrega não faz uma
+fusão geral de contatos nem presume equivalência entre IDs distintos.
+
+Em Ambiente do backend, sem remover `DATABASE_URL`/`PORT`:
+
+```env
+AUTO_REPLY_ENABLED=true
+AUTO_REPLY_INSTANCE=principal
+AUTO_REPLY_SESSION=teste
+TEST_CHAT_ID=ID_EXATO_DO_CONTATO_DE_TESTE
+WAHA_BASE_URL=http://atendimento-waha:3000
+WAHA_API_KEY=CHAVE_EXISTENTE_DA_WAHA
+```
+
+O endereço acima é a raiz da WAHA, **sem `/api` ou `/dashboard`**. Se o hostname
+interno não resolver, conferir aliases no Easypanel; nunca abrir portas para resolver
+comunicação interna. Chave inválida não deve ser impressa para diagnosticar erros.
+
+Implantar e, pelo console do backend ou Termius, executar:
+
+```bash
+docker exec "$(docker ps -q --filter label=com.docker.swarm.service.name=atendimento_backend | head -n 1)" node dist/control.js resume
+```
+
+O comando é restrito ao canal/contato definidos nas variáveis, exige conversa
+existente e canal/empresa ativos. Não existe endpoint público de administração.
+
+Só **novas mensagens de texto**, posteriores à retomada, com timestamp recente
+(até 120 segundos; tolerância de 30 segundos para relógio à frente) podem gerar
+resposta. Mensagens antigas já registradas não são respondidas retroativamente.
+Uma tarefa por mensagem, no máximo uma pendente por conversa e intervalo mínimo
+de 5 segundos após o último envio; mensagens extras desse intervalo ficam no
+histórico, sem resposta fixa adicional. Não testar enviando uma rajada.
+
+Para pausar:
+
+```bash
+docker exec "$(docker ps -q --filter label=com.docker.swarm.service.name=atendimento_backend | head -n 1)" node dist/control.js pause
+```
+
+Ou responder pelo celular. Depois dessa intervenção, rodar `resume` explicitamente
+para voltar a `auto`; isso invalida a fila antiga e não a reenvia.
+Para desligamento global, definir `AUTO_REPLY_ENABLED=false` e reimplantar.
+Uma requisição já enviada à WAHA não pode ser recolhida por uma pausa posterior.
+
+## Verificação do piloto
+
+1. Contato de teste envia mensagem nova: recebe uma resposta fixa.
+2. Eco da própria resposta: conversa continua em `auto`, sem loop.
+3. Funcionário responde pelo celular: conversa fica em `human`.
+4. Nova mensagem enquanto `human`: fica no histórico, sem resposta automática.
+5. Retomada explícita + mensagem nova: responde novamente.
+6. Outros contatos/empresas e grupos: não recebem resposta fixa.
+7. Reinício: histórico e tarefas persistem, sem repetir envios já tentados.
+
+```sql
+SELECT c.session, m.direction, cv.mode, m.received_at
+FROM messages m JOIN channels c ON c.id = m.channel_id
+JOIN conversations cv ON cv.id = m.conversation_id
+ORDER BY m.received_at DESC LIMIT 10;
+
+SELECT state, created_at, claimed_at, completed_at
+FROM reply_jobs ORDER BY created_at DESC LIMIT 10;
+```
+
+## Falhas e limites
+
+Não há garantia de envio exatamente uma vez pelo WhatsApp. A API pode enviar e
+falhar antes de devolver o ID. Por isso, após tentativa de rede, não há reenvio
+automático: timeout/resposta ambígua vira `uncertain`, erro de credencial vira
+`failed` e a conversa é pausada. Conferir o WhatsApp antes de retomar. Um novo
+`resume` permite só novas mensagens; nunca reenfileira o envio incerto anterior.
+
+A tarefa é marcada `sending` em uma transação curta antes da rede. Se o processo
+cair ou a gravação final falhar, ela não volta a `pending`; após 60 segundos é
+marcada `uncertain` e pausa a conversa se ela ainda estiver na mesma geração.
+Isso pode perder uma resposta, mas evita repetir um envio
+cujo resultado não conhecemos. A fila bloqueia novas tarefas da mesma geração
+enquanto houver resultado incerto.
+
+O envio mantém locks na ordem canal/conversa/tarefa por até o timeout da API
+(10 segundos), serializando o eco que pode chegar antes do ID da resposta.
+Isso pode atrasar o processamento de webhooks desse canal. Testar esse comportamento
+com a WAHA instalada; não afirmar capacidade de produção com base nos testes locais.
+Intervenção humana recebida antes do envio cancela a tarefa. Um envio já iniciado
+pode chegar mesmo se o funcionário responder nesse intervalo.
+
+Separar usuário de migração e de aplicação antes de produção; reduzir privilégios,
+definir retenção de mensagens, backups fora da VPS e testar restauração.
+Isolamento por autenticação de canal e FKs compostas; não há RLS nem acesso de clientes
+ao banco nesta fase. O dono do banco continua tendo acesso amplo.
+Manter versões/digests de WAHA fixados na operação comercial. Nunca registrar
+mensagens brutas, dados `_data`, chaves ou respostas de erro completas nos logs.

@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import { z } from 'zod';
 import { Store } from './store.js';
+import { directChat } from './automation.js';
 
 const envelopeSchema = z.object({
   event: z.string().min(1).max(100), session: z.string().min(1).max(200), payload: z.unknown().optional(),
@@ -13,7 +14,6 @@ const messageSchema = z.object({
   _data: z.unknown().optional(),
 });
 const gowsChatSchema = z.object({ Info: z.object({ Chat: z.string().min(1).max(255) }) });
-const directChat = (id: string) => /^\d+(?:@c\.us|@s\.whatsapp\.net|@lid)$/.test(id);
 
 export function buildApp(store: Store, logger = false) {
   const app = Fastify({
@@ -52,11 +52,14 @@ export function buildApp(store: Store, logger = false) {
       return reply.code(400).send({ error: 'invalid_message' });
     }
     const { _data, ...message } = parsed.data;
-    if (message.fromMe && !message.to) {
+    if (!message.fromMe || !message.to) {
       // GOWS app-sent messages can omit `to`; Info.Chat identifies the conversation.
       // Never substitute Info.Sender or `from`, which may identify our own account.
       const gowsChat = gowsChatSchema.safeParse(_data);
-      if (gowsChat.success) message.to = gowsChat.data.Info.Chat;
+      if (gowsChat.success) {
+        if (message.fromMe) message.to = gowsChat.data.Info.Chat;
+        else message.from = gowsChat.data.Info.Chat;
+      }
     }
     if (message.fromMe && !message.to) {
       request.log.warn({ reason: 'missing_recipient' }, 'WAHA webhook rejected');
