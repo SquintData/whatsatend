@@ -199,3 +199,27 @@ Isolamento por autenticação de canal e FKs compostas; não há RLS nem acesso 
 ao banco nesta fase. O dono do banco continua tendo acesso amplo.
 Manter versões/digests de WAHA fixados na operação comercial. Nunca registrar
 mensagens brutas, dados `_data`, chaves ou respostas de erro completas nos logs.
+# Retomada por reação no piloto
+
+O webhook da sessão deve incluir `message.any` e `message.reaction`. Uma reação
+`🤖` com `fromMe=true` e `source=app` retoma somente a conversa explicitamente
+configurada em `TEST_CHAT_ID`, quando a mensagem reagida é uma entrada já gravada
+nesse canal. Reações de clientes, via API, a mensagens enviadas, em outros contatos
+ou com outro emoji não liberam o atendimento. O comando ainda depende de
+`AUTO_REPLY_ENABLED=true`; o piloto continua usando resposta fixa, sem modelo de IA.
+
+O comando persiste no PostgreSQL, não responde ao histórico e não reinicia uma
+conversa que já está automática. Depois da reação, envie uma nova mensagem no
+segundo seguinte ou depois. Timestamps têm resolução de segundos: reações no mesmo
+segundo de uma pausa são ignoradas; remova e refaça a reação depois. Eventos com
+mais de 120 segundos ou mais de 30 segundos no futuro não retomam. Duplicatas e
+comandos anteriores a uma nova pausa não liberam a conversa novamente.
+
+Atualização no Easypanel: execute `node dist/migrate.js` antes de `node dist/server.js`
+para aplicar `003_reaction_resume.sql`, sem repetir o provisionamento. O servidor
+recusa iniciar com o esquema incompleto. Os logs `WAHA reaction processed` mostram
+o resultado, `fromMe` e `source`, sem conteúdo de mensagens ou tokens.
+
+Validação real pendente: reação da empresa retoma, reação do cliente não retoma,
+próxima mensagem recebe uma resposta e nova mensagem do funcionário pausa. O Chat
+UI não é usado como prova de entrega do evento; conferir os logs e o modo no banco.

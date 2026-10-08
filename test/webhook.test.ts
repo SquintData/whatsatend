@@ -12,6 +12,7 @@ async function fixture(automation: Automation = disabledAutomation) {
   const pg = new PGlite();
   await pg.exec(await readFile(new URL('../sql/001_initial.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/002_fixed_reply.sql', import.meta.url), 'utf8'));
+  await pg.exec(await readFile(new URL('../sql/003_reaction_resume.sql', import.meta.url), 'utf8'));
   const database: Database = {
     query: async <T>(sql: string, values?: unknown[]) => pg.query<T>(sql, values),
     transaction: fn => pg.transaction(tx => fn({
@@ -320,5 +321,80 @@ test('idempotent schema updates preserve existing history and human mode', async
     await f.pg.exec(await readFile(new URL('../sql/002_fixed_reply.sql', import.meta.url), 'utf8'));
     assert.equal((await f.pg.query('SELECT * FROM messages')).rows.length, 2);
     assert.equal((await f.pg.query<{ mode: string }>("SELECT mode FROM conversations WHERE chat_id = '5511888888888@c.us'")).rows[0]!.mode, 'human');
+  } finally { await f.close(); }
+});
+
+const reactionEvent = (id: string, timestamp: number, overrides = {}) => ({
+  event: 'message.reaction', session: enabled.session,
+  payload: { id, timestamp, fromMe: true, source: 'app',
+    reaction: { text: '🤖', messageId: 'seed' }, ...overrides },
+});
+
+test('employee reaction resumes without sending history; duplicate survives restart and later pause', async () => {
+  const f = await armed();
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    await f.store.control('pause');
+    await f.send(f.incoming('paused-incoming', now));
+    const command = reactionEvent('reaction-1', now + 1);
+    assert.equal((await f.send(command)).json().status, 'resumed');
+    assert.equal((await f.pg.query('SELECT * FROM reply_jobs')).rows.length, 0);
+    assert.equal((await f.send(command)).json().status, 'duplicate');
+    const restarted = buildApp(new Store(f.database, enabled));
+    try {
+      assert.equal((await restarted.inject({ method: 'POST', url: '/webhooks/waha/principal',
+        headers: { 'x-webhook-token': f.tokens[0]! }, payload: command })).json().status, 'duplicate');
+    } finally { await restarted.close(); }
+    await f.send(f.incoming('new-after-reaction', now + 2));
+    let sends = 0;
+    await new Store(f.database, enabled).processNext({ async send() { sends++; return { id: 'automatic-reply' }; } });
+    assert.equal(sends, 1);
+    await f.send({ ...f.event(), payload: { ...f.event().payload, id: 'employee-after-reaction',
+      fromMe: true, to: enabled.chatId, timestamp: now + 3 } });
+    assert.equal((await f.send(command)).json().status, 'duplicate');
+    assert.equal((await f.send(reactionEvent('delayed-old-reaction', now + 2))).json().status, 'ignored_state_or_timestamp');
+    assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE chat_id = $1', [enabled.chatId])).rows[0]!.mode, 'human');
+    assert.equal((await f.send(reactionEvent('new-reaction', now + 4))).json().status, 'resumed');
+  } finally { await f.close(); }
+});
+
+test('reaction rejects customers, other emoji, API actors, invalid targets and other tenants', async () => {
+  const f = await armed();
+  try {
+    await f.store.control('pause');
+    const now = Math.floor(Date.now() / 1000) + 1;
+    assert.equal((await f.send(reactionEvent('customer', now, { fromMe: false }))).json().status, 'ignored_reaction');
+    assert.equal((await f.send(reactionEvent('other-emoji', now, { reaction: { text: '👍', messageId: 'seed' } }))).json().status, 'ignored_reaction');
+    assert.equal((await f.send(reactionEvent('api-reaction', now, { source: 'api' }))).json().status, 'ignored_reaction');
+    assert.equal((await f.send(reactionEvent('missing-direction', now, { fromMe: undefined }))).statusCode, 400);
+    assert.equal((await f.send(reactionEvent('unknown-target', now, { reaction: { text: '🤖', messageId: 'unknown' } }))).json().status, 'ignored_target');
+    const other = { ...reactionEvent('other-tenant', now), session: 'session-1' };
+    assert.equal((await f.send(other)).statusCode, 401);
+    assert.equal((await f.send(other, f.tokens[1])).json().status, 'disabled_scope');
+    await f.send({ ...f.incoming('wrong-contact-target'), payload: { ...f.incoming('wrong-contact-target').payload, from: '999@c.us' } });
+    assert.equal((await f.send(reactionEvent('wrong-chat', now, { reaction: { text: '🤖', messageId: 'wrong-contact-target' } }))).json().status, 'ignored_target');
+    assert.equal((await f.pg.query('SELECT * FROM reaction_commands')).rows.length, 0);
+    assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE chat_id = $1', [enabled.chatId])).rows[0]!.mode, 'human');
+  } finally { await f.close(); }
+});
+
+test('reaction freshness, disabled flag and transaction rollback fail closed', async () => {
+  const f = await armed();
+  try {
+    await f.store.control('pause');
+    const now = Math.floor(Date.now() / 1000);
+    assert.equal((await f.send(reactionEvent('old', now - 300))).json().status, 'ignored_state_or_timestamp');
+    assert.equal((await f.send(reactionEvent('future', now + 300))).json().status, 'ignored_state_or_timestamp');
+    const disabled = buildApp(new Store(f.database));
+    try {
+      assert.equal((await disabled.inject({ method: 'POST', url: '/webhooks/waha/principal', headers: { 'x-webhook-token': f.tokens[0]! }, payload: reactionEvent('disabled', now + 1) })).json().status, 'disabled_scope');
+    } finally { await disabled.close(); }
+    await f.pg.exec(`CREATE FUNCTION reject_resume() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.mode = 'auto' THEN RAISE EXCEPTION 'forced storage failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER fail_resume BEFORE UPDATE ON conversations FOR EACH ROW EXECUTE FUNCTION reject_resume();`);
+    assert.equal((await f.send(reactionEvent('rollback', now + 1))).statusCode, 503);
+    assert.equal((await f.pg.query("SELECT * FROM reaction_commands WHERE provider_event_id = 'rollback'")).rows.length, 0);
+    await f.pg.exec('DROP TRIGGER fail_resume ON conversations');
+    assert.equal((await f.send(reactionEvent('rollback', now + 1))).json().status, 'resumed');
   } finally { await f.close(); }
 });

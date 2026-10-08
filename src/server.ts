@@ -35,6 +35,8 @@ process.on('SIGTERM', () => { void shutdown(); });
 process.on('SIGINT', () => { void shutdown(); });
 try {
   await db.query('SELECT 1 FROM reply_jobs LIMIT 1');
+  await db.query('SELECT control_timestamp FROM conversations LIMIT 1');
+  await db.query('SELECT 1 FROM reaction_commands LIMIT 1');
   await app.listen({ host: '0.0.0.0', port: config.data.PORT });
   if (automation.enabled) worker = startWorker(store, new WahaSender(automation), message => app.log.error(message));
   app.log.info({ enabled: automation.enabled }, 'Fixed test reply configuration loaded');

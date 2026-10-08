@@ -7,6 +7,10 @@ export interface Channel { id: string; organization_id: string; session: string;
 export interface Message {
   id: string; from: string; to?: string; fromMe: boolean; body: string; timestamp?: number;
 }
+export interface Reaction {
+  id: string; timestamp: number; fromMe: boolean; source?: string;
+  reaction: { text: string; messageId: string };
+}
 
 export class Store {
   constructor(private db: Database, private automation: Automation = disabledAutomation) {}
@@ -53,9 +57,10 @@ export class Store {
       );
       if (inserted.rows.length && message.fromMe) {
         await tx.query(
-          `UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1
+          `UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+           control_timestamp = GREATEST(control_timestamp, $3, floor(extract(epoch FROM now()))::bigint)
            WHERE id = $1 AND organization_id = $2`,
-          [conversationId, channel.organization_id],
+          [conversationId, channel.organization_id, message.timestamp ?? 0],
         );
         await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
           WHERE conversation_id = $1 AND state = 'pending'`, [conversationId]);
@@ -81,6 +86,44 @@ export class Store {
     });
   }
 
+  async react(channel: Channel, reaction: Reaction): Promise<string> {
+    const settings = this.automation;
+    if (!reaction.fromMe || reaction.source !== 'app' || reaction.reaction.text !== '🤖') return 'ignored_reaction';
+    if (!settings.enabled || channel.instance !== settings.instance || channel.session !== settings.session) return 'disabled_scope';
+    return this.db.transaction(async tx => {
+      const active = await tx.query(
+        `SELECT c.id FROM channels c JOIN organizations o ON o.id = c.organization_id
+         WHERE c.id = $1 AND c.organization_id = $2 AND c.active AND o.active FOR UPDATE OF c`,
+        [channel.id, channel.organization_id]);
+      if (!active.rows.length) return 'disabled_scope';
+      // Resolve the reacted-to message inside this authenticated tenant/channel.
+      // Reaction direction identifies the actor; target direction identifies the customer message.
+      const target = await tx.query<{ id: string }>(
+        `SELECT cv.id FROM messages m JOIN conversations cv ON cv.id = m.conversation_id
+         WHERE m.channel_id = $1 AND m.organization_id = $2 AND m.provider_message_id = $3
+         AND m.direction = 'incoming' AND cv.chat_id = $4 FOR UPDATE OF cv`,
+        [channel.id, channel.organization_id, reaction.reaction.messageId, settings.chatId]);
+      if (!target.rows[0]) return 'ignored_target';
+      const id = target.rows[0].id;
+      const inserted = await tx.query(
+        `INSERT INTO reaction_commands(organization_id, channel_id, conversation_id, provider_event_id, provider_timestamp)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (channel_id, provider_event_id) DO NOTHING RETURNING provider_event_id`,
+        [channel.organization_id, channel.id, id, reaction.id, reaction.timestamp]);
+      if (!inserted.rows.length) return 'duplicate';
+      const resumed = await tx.query(
+        `UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
+         automation_started_at = GREATEST(now(), to_timestamp($2 + 1)), control_timestamp = $2
+         WHERE id = $1 AND mode IN ('human','monitoring') AND $2 > control_timestamp
+         AND $2 >= extract(epoch FROM now()) - 120 AND $2 <= extract(epoch FROM now()) + 30
+         RETURNING id`, [id, reaction.timestamp]);
+      if (!resumed.rows.length) return 'ignored_state_or_timestamp';
+      await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
+        WHERE conversation_id = $1 AND state = 'pending'`, [id]);
+      // No reply is enqueued here: only a new incoming message can trigger it.
+      return 'resumed';
+    });
+  }
+
   async control(action: 'resume' | 'pause'): Promise<void> {
     const settings = this.automation;
     if (!settings.instance || !settings.session || !settings.chatId || (action === 'resume' && !settings.enabled)) {
@@ -95,7 +138,8 @@ export class Store {
       if (!channel.rows[0]) throw new Error('Active channel not found');
       const conversations = await tx.query<{ id: string }>(
         `UPDATE conversations SET mode = $1, automation_epoch = automation_epoch + 1,
-         automation_started_at = CASE WHEN $1 = 'auto' THEN now() ELSE automation_started_at END
+         automation_started_at = CASE WHEN $1 = 'auto' THEN now() ELSE automation_started_at END,
+         control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
          WHERE channel_id = $2 AND chat_id = $3 RETURNING id`,
         [action === 'resume' ? 'auto' : 'human', channel.rows[0].id, settings.chatId],
       );
@@ -120,7 +164,8 @@ export class Store {
            RETURNING conversation_id, epoch`, [channel.id],
         );
         for (const job of jobs.rows) {
-          await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1
+          await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+            control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
             WHERE id = $1 AND automation_epoch = $2`, [job.conversation_id, job.epoch]);
           await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
             WHERE conversation_id = $1 AND epoch = $2 AND state = 'pending'`, [job.conversation_id, job.epoch]);
@@ -174,7 +219,7 @@ export class Store {
       } catch (error) {
         const outcome = error instanceof SendError ? error.outcome : 'uncertain';
         await tx.query('UPDATE reply_jobs SET state = $1, completed_at = now() WHERE id = $2', [outcome, job.id]);
-        await tx.query("UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1 WHERE id = $1", [job.conversation_id]);
+        await tx.query("UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1, control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1", [job.conversation_id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
         return;
       }

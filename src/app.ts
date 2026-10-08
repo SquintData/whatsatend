@@ -14,6 +14,11 @@ const messageSchema = z.object({
   _data: z.unknown().optional(),
 });
 const gowsChatSchema = z.object({ Info: z.object({ Chat: z.string().min(1).max(255) }) });
+const reactionSchema = z.object({
+  id: z.string().min(1).max(512), timestamp: z.number().int().nonnegative().safe(),
+  fromMe: z.boolean(), source: z.string().max(32).optional(),
+  reaction: z.object({ text: z.string().max(32), messageId: z.string().min(1).max(512) }),
+});
 
 export function buildApp(store: Store, logger = false) {
   const app = Fastify({
@@ -45,6 +50,16 @@ export function buildApp(store: Store, logger = false) {
     }
     const channel = await store.authenticate(request.params.instance, envelope.data.session, token);
     if (!channel) return reply.code(401).send({ error: 'unauthorized' });
+    if (envelope.data.event === 'message.reaction') {
+      const parsed = reactionSchema.safeParse(envelope.data.payload);
+      if (!parsed.success) {
+        request.log.warn({ reason: 'invalid_reaction', issues: parsed.error.issues.map(issue => ({ field: issue.path.join('.'), code: issue.code })) }, 'WAHA reaction rejected; payload omitted');
+        return reply.code(400).send({ error: 'invalid_reaction' });
+      }
+      const result = await store.react(channel, parsed.data);
+      request.log.info({ result, fromMe: parsed.data.fromMe, source: parsed.data.source }, 'WAHA reaction processed');
+      return reply.code(200).send({ status: result });
+    }
     if (envelope.data.event !== 'message.any') return reply.code(202).send({ status: 'ignored_event' });
     const parsed = messageSchema.safeParse(envelope.data.payload);
     if (!parsed.success) {
