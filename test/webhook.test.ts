@@ -398,3 +398,21 @@ test('reaction freshness, disabled flag and transaction rollback fail closed', a
     assert.equal((await f.send(reactionEvent('rollback', now + 1))).json().status, 'resumed');
   } finally { await f.close(); }
 });
+
+test('removed reactions with null, absent or empty text are acknowledged without resuming', async () => {
+  const f = await armed();
+  try {
+    await f.store.control('pause');
+    const timestamp = Math.floor(Date.now() / 1000) + 1;
+    for (const [index, text] of [null, undefined, ''].entries()) {
+      const response = await f.send(reactionEvent(`removed-${index}`, timestamp,
+        { reaction: { text, messageId: 'seed' } }));
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().status, 'ignored_reaction');
+    }
+    assert.equal((await f.send(reactionEvent('invalid-text', timestamp,
+      { reaction: { text: 123, messageId: 'seed' } }))).statusCode, 400);
+    assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE chat_id = $1', [enabled.chatId])).rows[0]!.mode, 'human');
+    assert.equal((await f.pg.query('SELECT * FROM reaction_commands')).rows.length, 0);
+  } finally { await f.close(); }
+});

@@ -17,7 +17,7 @@ const gowsChatSchema = z.object({ Info: z.object({ Chat: z.string().min(1).max(2
 const reactionSchema = z.object({
   id: z.string().min(1).max(512), timestamp: z.number().int().nonnegative().safe(),
   fromMe: z.boolean(), source: z.string().max(32).optional(),
-  reaction: z.object({ text: z.string().max(32), messageId: z.string().min(1).max(512) }),
+  reaction: z.object({ text: z.string().max(32).nullish().transform(value => value ?? ''), messageId: z.string().min(1).max(512) }),
 });
 
 export function buildApp(store: Store, logger = false) {
