@@ -220,6 +220,8 @@ para aplicar `003_reaction_resume.sql`, sem repetir o provisionamento. O servido
 recusa iniciar com o esquema incompleto. Os logs `WAHA reaction processed` mostram
 o resultado, `fromMe` e `source`, sem conteúdo de mensagens ou tokens.
 
-Validação real pendente: reação da empresa retoma, reação do cliente não retoma,
-próxima mensagem recebe uma resposta e nova mensagem do funcionário pausa. O Chat
-UI não é usado como prova de entrega do evento; conferir os logs e o modo no banco.
+Validação na VPS em 08/10/2026: o usuário confirmou que a reação 🤖 da conta da
+empresa retoma, a reação do cliente não retoma, a próxima mensagem recebe uma
+resposta e uma nova mensagem do funcionário pausa a automação. Os logs também
+registraram `result=resumed`, `fromMe=true` e `source=app`. Isso não comprova
+concorrência em PostgreSQL real nem recuperação após reinício integral da VPS.
