@@ -11,6 +11,7 @@
     "migrate": "node --import tsx src/migrate.ts",
     "provision": "node --import tsx src/provision.ts",
     "ai:config": "node dist/ai-config.js",
+    "channel:scope": "node dist/channel-scope.js",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit"
   },

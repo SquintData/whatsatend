@@ -8,14 +8,14 @@ Node.js 22+, TypeScript, Fastify, PostgreSQL e WAHA/GOWS.
 - Webhook autenticado por canal; histórico e deduplicação por empresa/sessão.
 - Conversas individuais; identificação GOWS por `_data.Info.Chat`, inclusive quando `to` é null.
 - Resposta fixa de teste com fila persistente no PostgreSQL.
-- Envio desativado por padrão; limitado a uma instância, sessão e identificador de contato.
-- Conversas começam em `monitoring`. Retomada explícita muda para `auto`.
+- Envio desativado por padrao; ativacao opt-in independente por canal em `disabled`, `test` ou `all`.
+- Novos contatos diretos elegiveis entram em `auto` na primeira mensagem recente; conversas `human` exigem retomada explicita.
 - Resposta manual muda para `human` e cancela os envios pendentes da conversa.
 - IDs retornados pela API identificam respostas próprias, que não ativam modo humano.
 - IA opcional por empresa; empresas sem IA mantêm a resposta fixa do piloto. Sem painel administrativo, campanhas ou envio de mídia nesta etapa.
 
 A resposta fixa é: “Olá! Recebemos sua mensagem. Este é um teste do atendimento automático.”
-Não ativar esta versão para clientes: o envio foi limitado ao piloto autorizado.
+Use `all` somente com autorizacao do cliente; a ativacao de cada canal e sempre explicita.
 
 ## Desenvolvimento
 
@@ -83,8 +83,8 @@ Falha, falta de chave ou handoff pausam a conversa para atendimento humano, sem
 enviar uma resposta inventada. Com IA desativada para a empresa, continua a resposta
 fixa do piloto.
 
-Depois de definir `OPENAI_API_KEY` e manter o escopo global autorizado do piloto
-(`AUTO_REPLY_ENABLED`, instância, sessão e contato exato), execute a migração normal:
+Depois de definir `OPENAI_API_KEY`, mantenha `AUTO_REPLY_ENABLED=true` somente como kill switch global;
+a autorizacao efetiva e o escopo de cada canal, configurados explicitamente na secao abaixo. Execute a migracao normal:
 
 ```bash
 node dist/migrate.js
@@ -118,7 +118,7 @@ em `ai_usage`; a resposta e o conteúdo bruto do provedor não são gravados com
 
 ## Atualização da instalação existente
 
-A migração `002_fixed_reply.sql` adiciona modo `auto`, geração de automação e fila.
+A migracao `002_fixed_reply.sql` adiciona modo `auto`, automacao e fila. `005_channel_automation_scope.sql` cria escopo por canal com padrao `disabled`, que exige ativacao explicita do piloto.
 Não remove empresas ou histórico. O runner cria um registro de migrações e aplica
 arquivos novos uma vez, dentro de transação e lock de migração.
 Uma instalação antiga sem registro reaplica `001` de modo idempotente.
@@ -134,6 +134,25 @@ sh -c 'node dist/migrate.js && exec node dist/server.js'
 4. Confirmar `Database migrations ready` e servidor iniciado. Restaurar Command
    `node dist/server.js`. Não executar provisionamento novamente.
 5. Confirmar comunicação do backend com WAHA e a saúde do banco antes de ativar.
+
+## Ativacao opt-in por canal
+
+`005_channel_automation_scope.sql` adiciona escopo por canal com padrao `disabled`;
+apos a migracao nenhum canal responde ate ativacao administrativa explicita.
+O canal `test` aceita somente o ID direto exato; `all` aceita conversas diretas,
+excluindo grupos. Configure por instance/sessao, dentro do container do backend:
+
+```bash
+node dist/channel-scope.js principal teste test ID_EXATO_DO_CONTATO
+node dist/channel-scope.js principal segunda-sessao all --confirm-all
+node dist/channel-scope.js principal segunda-sessao disabled
+```
+
+`all` exige a confirmacao literal `--confirm-all`. `disabled` cancela tarefas
+pendentes/gerando e encerra o modo automatico ativo do canal. Conversas em `human`
+nao voltam ao automatico por novas mensagens; e preciso retomada explicita ou
+reacao valida no mesmo canal, sob seu escopo atual. Novos contatos diretos
+compativeis iniciam no automatico na primeira mensagem recente do canal opt-in.
 
 ## Ativação da resposta fixa
 
@@ -156,9 +175,7 @@ Em Ambiente do backend, sem remover `DATABASE_URL`/`PORT`:
 
 ```env
 AUTO_REPLY_ENABLED=true
-AUTO_REPLY_INSTANCE=principal
-AUTO_REPLY_SESSION=teste
-TEST_CHAT_ID=ID_EXATO_DO_CONTATO_DE_TESTE
+# AUTO_REPLY_INSTANCE, AUTO_REPLY_SESSION e TEST_CHAT_ID sao opcionais/legado; podem ficar vazios.
 WAHA_BASE_URL=http://atendimento-waha:3000
 WAHA_API_KEY=CHAVE_EXISTENTE_DA_WAHA
 ```
@@ -167,18 +184,9 @@ O endereço acima é a raiz da WAHA, **sem `/api` ou `/dashboard`**. Se o hostna
 interno não resolver, conferir aliases no Easypanel; nunca abrir portas para resolver
 comunicação interna. Chave inválida não deve ser impressa para diagnosticar erros.
 
-Implantar e, pelo console do backend ou Termius, executar:
+Ative cada canal com `node dist/channel-scope.js` conforme acima. `AUTO_REPLY_INSTANCE`, `AUTO_REPLY_SESSION` e `TEST_CHAT_ID` sao opcionais e legados; podem ser omitidos ou vazios com `AUTO_REPLY_ENABLED=true`. Novos contatos diretos elegiveis entram em auto na primeira mensagem recente apos ativacao. Conversas em `human` nao retomam por novas mensagens; retome explicitamente, por exemplo com reacao `🤖` valida no proprio canal.
 
-```bash
-docker exec "$(docker ps -q --filter label=com.docker.swarm.service.name=atendimento_backend | head -n 1)" node dist/control.js resume
-```
-
-O comando é restrito ao canal/contato definidos nas variáveis, exige conversa
-existente e canal/empresa ativos. Não existe endpoint público de administração.
-
-Só **novas mensagens de texto**, posteriores à retomada, com timestamp recente
-(até 120 segundos; tolerância de 30 segundos para relógio à frente) podem gerar
-resposta. Mensagens antigas já registradas não são respondidas retroativamente.
+So mensagens com timestamp posterior a ativacao do canal ou a retomada explicita, e recente (ate 120 segundos; tolerancia de 30 segundos para relogio a frente), podem gerar resposta. Mensagens anteriores nao sao respondidas retroativamente.
 Uma tarefa por mensagem, no máximo uma pendente por conversa e intervalo mínimo
 de 5 segundos após o último envio; mensagens extras desse intervalo ficam no
 histórico, sem resposta fixa adicional. Não testar enviando uma rajada.
@@ -186,22 +194,22 @@ histórico, sem resposta fixa adicional. Não testar enviando uma rajada.
 Para pausar:
 
 ```bash
-docker exec "$(docker ps -q --filter label=com.docker.swarm.service.name=atendimento_backend | head -n 1)" node dist/control.js pause
+docker exec "$(docker ps -q --filter label=com.docker.swarm.service.name=atendimento_backend | head -n 1)" node dist/channel-scope.js principal teste disabled
 ```
 
-Ou responder pelo celular. Depois dessa intervenção, rodar `resume` explicitamente
-para voltar a `auto`; isso invalida a fila antiga e não a reenvia.
+Ou responder pelo celular. Isso muda o modo para `human`; mensagens novas nao retomam automaticamente.
+Para retomar, use uma reacao `🤖` valida no proprio canal ou a ferramenta administrativa autorizada.
 Para desligamento global, definir `AUTO_REPLY_ENABLED=false` e reimplantar.
 Uma requisição já enviada à WAHA não pode ser recolhida por uma pausa posterior.
 
 ## Verificação do piloto
 
-1. Contato de teste envia mensagem nova: recebe uma resposta fixa.
+1. Contato direto elegivel envia mensagem recente apos opt-in; recebe resposta fixa ou da IA da empresa.
 2. Eco da própria resposta: conversa continua em `auto`, sem loop.
 3. Funcionário responde pelo celular: conversa fica em `human`.
 4. Nova mensagem enquanto `human`: fica no histórico, sem resposta automática.
 5. Retomada explícita + mensagem nova: responde novamente.
-6. Outros contatos/empresas e grupos: não recebem resposta fixa.
+6. Canais `disabled` e grupos nunca recebem resposta; outros canais respondem somente apos opt-in.
 7. Reinício: histórico e tarefas persistem, sem repetir envios já tentados.
 
 ```sql
@@ -244,14 +252,9 @@ Manter versões/digests de WAHA fixados na operação comercial. Nunca registrar
 mensagens brutas, dados `_data`, chaves ou respostas de erro completas nos logs.
 # Retomada por reação no piloto
 
-O webhook da sessão deve incluir `message.any` e `message.reaction`. Uma reação
-`🤖` com `fromMe=true` e `source=app` retoma somente a conversa explicitamente
-configurada em `TEST_CHAT_ID`, quando a mensagem reagida é uma entrada já gravada
-nesse canal. Reações de clientes, via API, a mensagens enviadas, em outros contatos
-ou com outro emoji não liberam o atendimento. O comando ainda depende de
-`AUTO_REPLY_ENABLED=true`; empresas com IA desativada continuam usando a resposta
-fixa do piloto. Para uma empresa com IA ativada, a próxima mensagem usa a
-configuração dessa empresa.
+Uma reacao `🤖` com `fromMe=true` e `source=app` retoma somente conversa elegivel do proprio canal autenticado e dentro do escopo atual (`test` exato ou `all` direto).
+Reacoes de clientes, via API, a mensagens enviadas, fora do escopo ou com outro emoji nao retomam. O kill switch global `AUTO_REPLY_ENABLED` precisa estar ativo.
+Empresas com IA desativada continuam usando a resposta fixa do piloto; para empresas com IA ativada, a proxima mensagem usa sua configuracao.
 
 O comando persiste no PostgreSQL, não responde ao histórico e não reinicia uma
 conversa que já está automática. Depois da reação, envie uma nova mensagem no
@@ -261,7 +264,7 @@ mais de 120 segundos ou mais de 30 segundos no futuro não retomam. Duplicatas e
 comandos anteriores a uma nova pausa não liberam a conversa novamente.
 
 Atualização no Easypanel: execute `node dist/migrate.js` antes de `node dist/server.js`
-para aplicar as migrações pendentes, incluindo `004_company_ai.sql`, sem repetir o provisionamento. O servidor
+para aplicar as migrações pendentes, incluindo `004_company_ai.sql` e `005_channel_automation_scope.sql`; todos os canais ficam disabled ate ativacao explicita, sem repetir o provisionamento. O servidor
 recusa iniciar com o esquema incompleto. Os logs `WAHA reaction processed` mostram
 o resultado, `fromMe` e `source`, sem conteúdo de mensagens ou tokens.
 
