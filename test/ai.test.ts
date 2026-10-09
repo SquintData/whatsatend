@@ -12,7 +12,7 @@ const chatIds = ['5511999999991@c.us', '5511999999992@c.us'] as const;
 
 async function fixture(aiEnabled: boolean[] = [true, true]) {
   const pg = new PGlite();
-  for (const name of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql']) {
+  for (const name of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${name}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -27,8 +27,9 @@ async function fixture(aiEnabled: boolean[] = [true, true]) {
   for (let i = 0; i < 2; i++) {
     await pg.query('INSERT INTO organizations(id,name,ai_enabled,ai_model,ai_business_data,ai_tone,ai_instructions) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [organizations[i], `Company ${i}`, aiEnabled[i], 'test-model', { services: [`private-service-${i}`], faqs: [{ q: `question-${i}`, a: `answer-${i}` }] }, `tone-${i}`, `instruction-${i}`]);
-    await pg.query('INSERT INTO channels(id,organization_id,instance,session,token_hash) VALUES ($1,$2,$3,$4,$5)',
-      [channels[i], organizations[i], `instance-${i}`, `session-${i}`, tokenHash(tokens[i]!)]);
+    await pg.query(`INSERT INTO channels(id,organization_id,instance,session,token_hash,automation_scope,automation_test_chat_id,automation_activated_at)
+      VALUES ($1,$2,$3,$4,$5,'test',$6,to_timestamp(floor(extract(epoch FROM now())) - 1))`,
+      [channels[i], organizations[i], `instance-${i}`, `session-${i}`, tokenHash(tokens[i]!), chatIds[i]]);
     await pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode,automation_started_at)
       VALUES ($1,$2,$3,$4,'auto',now())`, [conversations[i], organizations[i], channels[i], chatIds[i]]);
     await pg.query(`INSERT INTO messages(id,organization_id,channel_id,conversation_id,provider_message_id,direction,body,provider_timestamp)
@@ -112,6 +113,26 @@ test('company AI opt-out during generation cancels the generated reply without f
     await processing;
     assert.equal(f.senderCalls.length, 0);
     assert.equal((await f.pg.query<{ state: string }>("SELECT state FROM reply_jobs WHERE source_message_id IN (SELECT id FROM messages WHERE provider_message_id = 'opt-out-incoming')")).rows[0]!.state, 'cancelled');
+    assert.equal((await f.pg.query('SELECT * FROM messages WHERE direction = \'outgoing\'')).rows.length, 0);
+  } finally { await f.close(); }
+});
+
+test('channel scope change during generation cancels the generated reply without fixed fallback', async () => {
+  const f = await fixture();
+  let started!: () => void;
+  let finish!: (decision: AIDecision) => void;
+  const generationStarted = new Promise<void>(resolve => { started = resolve; });
+  const provider: AIProvider = { generate: async () => { started(); return new Promise<AIDecision>(resolve => { finish = resolve; }); } };
+  try {
+    const store = f.storeFor(0, provider);
+    await f.addIncoming(0, 'scope-change-incoming', 'question before scope change', store);
+    const processing = store.processNext(f.sender);
+    await generationStarted;
+    await f.pg.query("UPDATE channels SET automation_scope = 'disabled', automation_test_chat_id = NULL WHERE id = $1", [f.channels[0]]);
+    finish(reply('must not be sent'));
+    await processing;
+    assert.equal(f.senderCalls.length, 0);
+    assert.equal((await f.pg.query<{ state: string }>("SELECT state FROM reply_jobs WHERE source_message_id IN (SELECT id FROM messages WHERE provider_message_id = 'scope-change-incoming')")).rows[0]!.state, 'cancelled');
     assert.equal((await f.pg.query('SELECT * FROM messages WHERE direction = \'outgoing\'')).rows.length, 0);
   } finally { await f.close(); }
 });

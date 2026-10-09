@@ -14,6 +14,7 @@ async function fixture(automation: Automation = disabledAutomation) {
   await pg.exec(await readFile(new URL('../sql/002_fixed_reply.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/003_reaction_resume.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/004_company_ai.sql', import.meta.url), 'utf8'));
+  await pg.exec(await readFile(new URL('../sql/005_channel_automation_scope.sql', import.meta.url), 'utf8'));
   const database: Database = {
     query: async <T>(sql: string, values?: unknown[]) => pg.query<T>(sql, values),
     transaction: fn => pg.transaction(tx => fn({
@@ -25,14 +26,15 @@ async function fixture(automation: Automation = disabledAutomation) {
   const tokens = ['a'.repeat(64), 'b'.repeat(64)];
   for (let i = 0; i < 2; i++) {
     await pg.query('INSERT INTO organizations(id,name) VALUES ($1,$2)', [companies[i], `Company ${i}`]);
-    await pg.query('INSERT INTO channels(id,organization_id,instance,session,token_hash) VALUES ($1,$2,$3,$4,$5)',
+    await pg.query(`INSERT INTO channels(id,organization_id,instance,session,token_hash,automation_scope,automation_test_chat_id,automation_activated_at)
+      VALUES ($1,$2,$3,$4,$5,'test','111111111111@lid',to_timestamp(floor(extract(epoch FROM now())) - 1))`,
       [channels[i], companies[i], 'principal', `session-${i}`, tokenHash(tokens[i]!)]);
   }
   const store = new Store(database, automation);
   const app = buildApp(store);
   const event = (session = 'session-0', fromMe = false) => ({
     event: 'message.any', session,
-    payload: { id: 'message-1', from: '5511999999999@c.us', to: '5511888888888@c.us', fromMe, body: 'Olá', timestamp: 1700000000 },
+    payload: { id: 'message-1', from: '5511999999999@c.us', to: '5511888888888@c.us', fromMe, body: 'Olá', timestamp: Math.floor(Date.now() / 1000) },
   });
   const send = (payload: unknown, token = tokens[0]) => app.inject({
     method: 'POST', url: '/webhooks/waha/principal', headers: { 'x-webhook-token': token! }, payload,
@@ -142,7 +144,7 @@ const enabled: Automation = {
 };
 async function armed() {
   const f = await fixture(enabled);
-  await f.send({ ...f.event(), payload: { ...f.event().payload, id: 'seed', from: enabled.chatId } });
+  await f.send({ ...f.event(), payload: { ...f.event().payload, id: 'seed', from: enabled.chatId, body: '' } });
   await f.store.control('resume');
   const incoming = (id: string, timestamp = Math.floor(Date.now() / 1000)) => ({
     ...f.event(), payload: { ...f.event().payload, id, from: enabled.chatId, timestamp },
@@ -159,6 +161,9 @@ test('automation fails closed, is opt-in and never targets groups', () => {
     TEST_CHAT_ID: enabled.chatId, WAHA_BASE_URL: enabled.wahaUrl, WAHA_API_KEY: enabled.apiKey,
   };
   assert.equal(loadAutomation(env).chatId, enabled.chatId);
+  assert.equal(loadAutomation({ AUTO_REPLY_ENABLED: 'true', WAHA_BASE_URL: enabled.wahaUrl, WAHA_API_KEY: enabled.apiKey }).enabled, true);
+  assert.equal(loadAutomation({ AUTO_REPLY_ENABLED: 'true', AUTO_REPLY_INSTANCE: '', AUTO_REPLY_SESSION: '', TEST_CHAT_ID: '',
+    WAHA_BASE_URL: enabled.wahaUrl, WAHA_API_KEY: enabled.apiKey }).enabled, true);
   assert.throws(() => loadAutomation({ ...env, TEST_CHAT_ID: '123@g.us' }));
   assert.throws(() => loadAutomation({ ...env, WAHA_BASE_URL: 'https://example.com/api' }));
 });
@@ -169,8 +174,8 @@ test('new messages only, scope checks, deduplication and own echo before send co
     assert.equal((await f.send(f.incoming('reply-1'))).json().status, 'stored');
     assert.equal((await f.send(f.incoming('reply-1'))).json().status, 'duplicate');
     await f.send(f.incoming('stale', Math.floor(Date.now() / 1000) - 300));
-    await f.send({ ...f.incoming('wrong-contact'), payload: { ...f.incoming('wrong-contact').payload, from: '999@c.us' } });
-    await f.send({ ...f.incoming('other-company'), session: 'session-1' }, f.tokens[1]);
+    await f.send({ ...f.incoming('wrong-contact'), payload: { ...f.incoming('wrong-contact').payload, from: '999@c.us', _data: { Info: { Chat: '999@c.us' } } } });
+    await f.send({ ...f.incoming('other-company'), payload: { ...f.incoming('other-company').payload, from: '999@c.us', _data: { Info: { Chat: '999@c.us' } } }, session: 'session-1' }, f.tokens[1]);
     assert.equal((await f.pg.query('SELECT * FROM reply_jobs')).rows.length, 1);
     let sends = 0;
     let echo: ReturnType<typeof f.send> | undefined;
@@ -222,9 +227,20 @@ test('claimed job rechecks human mode before sending and resume invalidates old 
     await f.store.control('resume');
     assert.equal((await f.pg.query<{ state: string }>('SELECT state FROM reply_jobs')).rows[0]!.state, 'cancelled');
     await f.send(f.incoming('pending-disabled-channel'));
-    await f.pg.query('UPDATE channels SET active = false WHERE id = $1', [f.channels[0]]);
+    let deactivateAfterClaim = true;
+    const instrumented: Database = {
+      transaction: fn => f.database.transaction(fn),
+      async query<T>(sql: string, values?: unknown[]) {
+        const result = await f.database.query<T>(sql, values);
+        if (deactivateAfterClaim && sql.includes('WITH candidate')) {
+          deactivateAfterClaim = false;
+          await f.pg.query('UPDATE channels SET active = false WHERE id = $1', [f.channels[0]]);
+        }
+        return result;
+      },
+    };
     let called = false;
-    assert.equal(await f.store.processNext({ async send() { called = true; return { id: 'bad' }; } }), true);
+    assert.equal(await new Store(instrumented, enabled).processNext({ async send() { called = true; return { id: 'bad' }; } }), true);
     assert.equal(called, false);
     assert.equal((await f.pg.query("SELECT * FROM reply_jobs WHERE state = 'cancelled'")).rows.length, 2);
   } finally { await f.close(); }
@@ -263,19 +279,21 @@ test('database failure after successful send never repeats the network call', as
   } finally { await f.close(); }
 });
 
-test('WAHA adapter checks scope, sends the API key, and never follows redirects', async () => {
-  let calls = 0;
+test('WAHA adapter sends the selected channel session, protects the API key, and never follows redirects', async () => {
+  const requests: unknown[] = [];
   const sender = new WahaSender(enabled, async (url, options) => {
-    calls++;
     assert.equal(url, 'http://waha:3000/api/sendText');
     assert.equal(options?.redirect, 'error');
     assert.equal((options?.headers as Record<string, string>)['X-Api-Key'], enabled.apiKey);
-    assert.deepEqual(JSON.parse(options?.body as string), { session: enabled.session, chatId: enabled.chatId, text: FIXED_REPLY });
+    requests.push(JSON.parse(options?.body as string));
     return new Response(JSON.stringify({ id: 'provider-id' }), { status: 200 });
   });
-  await assert.rejects(sender.send({ session: enabled.session, chatId: 'other@c.us', text: FIXED_REPLY }));
+  assert.deepEqual(await sender.send({ session: 'second-session', chatId: '222222222222@lid', text: FIXED_REPLY }), { id: 'provider-id' });
   assert.deepEqual(await sender.send({ session: enabled.session, chatId: enabled.chatId, text: FIXED_REPLY }), { id: 'provider-id' });
-  assert.equal(calls, 1);
+  assert.deepEqual(requests, [
+    { session: 'second-session', chatId: '222222222222@lid', text: FIXED_REPLY },
+    { session: enabled.session, chatId: enabled.chatId, text: FIXED_REPLY },
+  ]);
   const invalidResponse = new WahaSender(enabled, async () => new Response('{}', { status: 200 }));
   await assert.rejects(invalidResponse.send({ session: enabled.session, chatId: enabled.chatId, text: FIXED_REPLY }),
     (error: unknown) => error instanceof SendError && error.outcome === 'uncertain');
@@ -371,8 +389,9 @@ test('reaction rejects customers, other emoji, API actors, invalid targets and o
     assert.equal((await f.send(reactionEvent('unknown-target', now, { reaction: { text: '🤖', messageId: 'unknown' } }))).json().status, 'ignored_target');
     const other = { ...reactionEvent('other-tenant', now), session: 'session-1' };
     assert.equal((await f.send(other)).statusCode, 401);
+    await f.pg.query("UPDATE channels SET automation_scope = 'disabled', automation_test_chat_id = NULL, automation_activated_at = NULL WHERE id = $1", [f.channels[1]]);
     assert.equal((await f.send(other, f.tokens[1])).json().status, 'disabled_scope');
-    await f.send({ ...f.incoming('wrong-contact-target'), payload: { ...f.incoming('wrong-contact-target').payload, from: '999@c.us' } });
+    await f.send({ ...f.incoming('wrong-contact-target'), payload: { ...f.incoming('wrong-contact-target').payload, from: '999@c.us', _data: { Info: { Chat: '999@c.us' } } } });
     assert.equal((await f.send(reactionEvent('wrong-chat', now, { reaction: { text: '🤖', messageId: 'wrong-contact-target' } }))).json().status, 'ignored_target');
     assert.equal((await f.pg.query('SELECT * FROM reaction_commands')).rows.length, 0);
     assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE chat_id = $1', [enabled.chatId])).rows[0]!.mode, 'human');

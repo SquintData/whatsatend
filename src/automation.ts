@@ -4,6 +4,7 @@ export const FIXED_REPLY = 'Olá! Recebemos sua mensagem. Este é um teste do at
 export const directChat = (id: string) => /^\d+(?:@c\.us|@s\.whatsapp\.net|@lid)$/.test(id);
 export interface Automation {
   enabled: boolean;
+  // Optional legacy scope used only by the pause/resume CLI.
   instance: string;
   session: string;
   chatId: string;
@@ -13,6 +14,12 @@ export interface Automation {
 export const disabledAutomation: Automation = {
   enabled: false, instance: '', session: '', chatId: '', wahaUrl: '', apiKey: '',
 };
+export type ChannelAutomationScope = 'disabled' | 'test' | 'all';
+export function channelChatAllowed(scope: ChannelAutomationScope, testChatId: string | null | undefined, chatId: string): boolean {
+  if (scope === 'all') return directChat(chatId);
+  return scope === 'test' && !!testChatId && testChatId === chatId && directChat(chatId);
+}
+
 export function loadAutomation(env: NodeJS.ProcessEnv): Automation {
   if (env.AUTO_REPLY_ENABLED !== undefined && !['true', 'false'].includes(env.AUTO_REPLY_ENABLED)) {
     throw new Error('AUTO_REPLY_ENABLED must be true or false');
@@ -23,9 +30,12 @@ export function loadAutomation(env: NodeJS.ProcessEnv): Automation {
     instance: env.AUTO_REPLY_INSTANCE ?? '', session: env.AUTO_REPLY_SESSION ?? '', chatId: env.TEST_CHAT_ID ?? '',
   };
   const parsed = z.object({
-    AUTO_REPLY_INSTANCE: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/),
-    AUTO_REPLY_SESSION: z.string().min(1).max(200),
-    TEST_CHAT_ID: z.string().refine(directChat),
+    AUTO_REPLY_INSTANCE: z.preprocess(value => value === '' ? undefined : value,
+      z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/).optional()).default(''),
+    AUTO_REPLY_SESSION: z.preprocess(value => value === '' ? undefined : value,
+      z.string().min(1).max(200).optional()).default(''),
+    TEST_CHAT_ID: z.preprocess(value => value === '' ? undefined : value,
+      z.string().refine(directChat).optional()).default(''),
     WAHA_BASE_URL: z.string().url().refine(value => {
       const url = new URL(value);
       return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
@@ -33,7 +43,7 @@ export function loadAutomation(env: NodeJS.ProcessEnv): Automation {
     }),
     WAHA_API_KEY: z.string().min(32).max(256).refine(value => value === value.trim()),
   }).safeParse(env);
-  if (!parsed.success) throw new Error('Invalid automation configuration; check scope, test chat, WAHA URL and key');
+  if (!parsed.success) throw new Error('Invalid automation configuration; check WAHA URL and key');
   return {
     enabled, instance: parsed.data.AUTO_REPLY_INSTANCE, session: parsed.data.AUTO_REPLY_SESSION,
     chatId: parsed.data.TEST_CHAT_ID, wahaUrl: parsed.data.WAHA_BASE_URL.replace(/\/$/, ''), apiKey: parsed.data.WAHA_API_KEY,
@@ -48,7 +58,7 @@ export class SendError extends Error {
 export class WahaSender implements Sender {
   constructor(private settings: Automation, private transport: typeof fetch = fetch) {}
   async send(request: SendRequest): Promise<{ id: string }> {
-    if (!this.settings.enabled || request.session !== this.settings.session || request.chatId !== this.settings.chatId) {
+    if (!this.settings.enabled || !/^[a-zA-Z0-9_-]{1,200}$/.test(request.session) || !directChat(request.chatId)) {
       throw new SendError('failed');
     }
     try {
