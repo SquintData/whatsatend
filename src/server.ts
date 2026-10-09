@@ -4,6 +4,7 @@ import { createDatabase } from './db.js';
 import { Store } from './store.js';
 import { loadAutomation, WahaSender, type Automation } from './automation.js';
 import { startWorker } from './worker.js';
+import { OpenAIResponsesProvider } from './ai.js';
 
 const config = z.object({
   DATABASE_URL: z.string().url().refine(v => /^postgres(?:ql)?:\/\//.test(v)),
@@ -15,13 +16,17 @@ if (!config.success) {
 }
 const { db, close } = createDatabase(config.data.DATABASE_URL);
 let automation: Automation;
-try { automation = loadAutomation(process.env); }
+let aiProvider: OpenAIResponsesProvider | undefined;
+try {
+  automation = loadAutomation(process.env);
+  if (process.env.OPENAI_API_KEY) aiProvider = new OpenAIResponsesProvider(process.env.OPENAI_API_KEY);
+}
 catch {
-  console.error('Invalid automation configuration: check enabled flag, scope, test chat, WAHA URL and key');
+  console.error('Invalid automation configuration: check enabled flag, scope, test chat, WAHA URL and configured API keys');
   await close();
   process.exit(1);
 }
-const store = new Store(db, automation);
+const store = new Store(db, automation, aiProvider);
 const app = buildApp(store, true);
 let worker: ReturnType<typeof startWorker> | undefined;
 app.addHook('onClose', async () => { await worker?.stop(); await close(); });
@@ -37,9 +42,10 @@ try {
   await db.query('SELECT 1 FROM reply_jobs LIMIT 1');
   await db.query('SELECT control_timestamp FROM conversations LIMIT 1');
   await db.query('SELECT 1 FROM reaction_commands LIMIT 1');
+  await db.query('SELECT 1 FROM ai_usage LIMIT 1');
   await app.listen({ host: '0.0.0.0', port: config.data.PORT });
   if (automation.enabled) worker = startWorker(store, new WahaSender(automation), message => app.log.error(message));
-  app.log.info({ enabled: automation.enabled }, 'Fixed test reply configuration loaded');
+  app.log.info({ enabled: automation.enabled, aiProviderConfigured: !!aiProvider }, 'Automation configuration loaded');
 } catch {
   console.error('Startup failed: check database availability and run migrations');
   await app.close();

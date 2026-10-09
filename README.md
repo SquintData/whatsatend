@@ -12,7 +12,7 @@ Node.js 22+, TypeScript, Fastify, PostgreSQL e WAHA/GOWS.
 - Conversas começam em `monitoring`. Retomada explícita muda para `auto`.
 - Resposta manual muda para `human` e cancela os envios pendentes da conversa.
 - IDs retornados pela API identificam respostas próprias, que não ativam modo humano.
-- Sem IA, painel administrativo, campanhas ou envio de mídia nesta etapa.
+- IA opcional por empresa; empresas sem IA mantêm a resposta fixa do piloto. Sem painel administrativo, campanhas ou envio de mídia nesta etapa.
 
 A resposta fixa é: “Olá! Recebemos sua mensagem. Este é um teste do atendimento automático.”
 Não ativar esta versão para clientes: o envio foi limitado ao piloto autorizado.
@@ -72,6 +72,49 @@ Configurar reenvio de falhas de rede/5xx segundo a versão instalada.
 
 Nenhuma porta pública ou domínio adicional é necessário para o backend ou banco.
 Administração via Tailscale; WAHA exige chave de API e senha no dashboard.
+
+## Configuração opcional da IA por empresa
+
+A primeira integração usa a OpenAI Responses API. `OPENAI_API_KEY` fica somente
+no ambiente do backend; nunca salve a chave no JSON de configuração, banco ou logs.
+O modelo é configurável por empresa. As chamadas usam `store: false`, timeout de
+20 segundos, histórico recente limitado e resposta estruturada `reply`/`handoff`.
+Falha, falta de chave ou handoff pausam a conversa para atendimento humano, sem
+enviar uma resposta inventada. Com IA desativada para a empresa, continua a resposta
+fixa do piloto.
+
+Depois de definir `OPENAI_API_KEY` e manter o escopo global autorizado do piloto
+(`AUTO_REPLY_ENABLED`, instância, sessão e contato exato), execute a migração normal:
+
+```bash
+node dist/migrate.js
+```
+
+Crie um arquivo JSON protegido fora do repositório, por exemplo:
+
+```json
+{
+  "enabled": true,
+  "model": "gpt-4o-mini",
+  "businessData": {
+    "description": "Atendimento da empresa",
+    "services": ["Serviço de exemplo"],
+    "faqs": [{ "question": "Qual o horário?", "answer": "Segunda a sexta, 9h-18h." }]
+  },
+  "tone": "Natural e cordial",
+  "instructions": "Não prometa disponibilidade sem confirmação."
+}
+```
+
+Configure a empresa pelo canal já provisionado, sem painel:
+
+```bash
+npm run ai:config -- principal teste /caminho/protegido/empresa.json
+```
+
+Os dados aceitos ficam limitados a 10 KB, tom a 300 caracteres e instruções a
+2.000 caracteres. Uso de tokens de entrada/saída é registrado por tarefa e empresa
+em `ai_usage`; a resposta e o conteúdo bruto do provedor não são gravados como log.
 
 ## Atualização da instalação existente
 
@@ -206,7 +249,9 @@ O webhook da sessão deve incluir `message.any` e `message.reaction`. Uma reaç�
 configurada em `TEST_CHAT_ID`, quando a mensagem reagida é uma entrada já gravada
 nesse canal. Reações de clientes, via API, a mensagens enviadas, em outros contatos
 ou com outro emoji não liberam o atendimento. O comando ainda depende de
-`AUTO_REPLY_ENABLED=true`; o piloto continua usando resposta fixa, sem modelo de IA.
+`AUTO_REPLY_ENABLED=true`; empresas com IA desativada continuam usando a resposta
+fixa do piloto. Para uma empresa com IA ativada, a próxima mensagem usa a
+configuração dessa empresa.
 
 O comando persiste no PostgreSQL, não responde ao histórico e não reinicia uma
 conversa que já está automática. Depois da reação, envie uma nova mensagem no
@@ -216,7 +261,7 @@ mais de 120 segundos ou mais de 30 segundos no futuro não retomam. Duplicatas e
 comandos anteriores a uma nova pausa não liberam a conversa novamente.
 
 Atualização no Easypanel: execute `node dist/migrate.js` antes de `node dist/server.js`
-para aplicar `003_reaction_resume.sql`, sem repetir o provisionamento. O servidor
+para aplicar as migrações pendentes, incluindo `004_company_ai.sql`, sem repetir o provisionamento. O servidor
 recusa iniciar com o esquema incompleto. Os logs `WAHA reaction processed` mostram
 o resultado, `fromMe` e `source`, sem conteúdo de mensagens ou tokens.
 

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Database } from './db.js';
 import { disabledAutomation, FIXED_REPLY, SendError, type Automation, type Sender } from './automation.js';
+import type { AIContext, AIDecision, AIProvider } from './ai.js';
 
 export const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
 export interface Channel { id: string; organization_id: string; session: string; instance?: string }
@@ -13,7 +14,7 @@ export interface Reaction {
 }
 
 export class Store {
-  constructor(private db: Database, private automation: Automation = disabledAutomation) {}
+  constructor(private db: Database, private automation: Automation = disabledAutomation, private aiProvider?: AIProvider) {}
 
   async authenticate(instance: string, session: string, token: string): Promise<Channel | undefined> {
     const result = await this.db.query<Channel>(
@@ -153,14 +154,14 @@ export class Store {
     await this.db.transaction(async tx => {
       const channels = await tx.query<{ id: string }>(
         `SELECT c.id FROM channels c WHERE EXISTS (
-           SELECT 1 FROM reply_jobs j WHERE j.channel_id = c.id AND j.state = 'sending'
+           SELECT 1 FROM reply_jobs j WHERE j.channel_id = c.id AND j.state IN ('sending','generating')
            AND j.claimed_at < now() - interval '60 seconds')
          ORDER BY c.id FOR UPDATE OF c SKIP LOCKED`,
       );
       for (const channel of channels.rows) {
         const jobs = await tx.query<{ conversation_id: string; epoch: number }>(
           `UPDATE reply_jobs SET state = 'uncertain', completed_at = now()
-           WHERE channel_id = $1 AND state = 'sending' AND claimed_at < now() - interval '60 seconds'
+           WHERE channel_id = $1 AND state IN ('sending','generating') AND claimed_at < now() - interval '60 seconds'
            RETURNING conversation_id, epoch`, [channel.id],
         );
         for (const job of jobs.rows) {
@@ -177,18 +178,91 @@ export class Store {
   async processNext(sender: Sender): Promise<boolean> {
     const settings = this.automation;
     if (!settings.enabled) return false;
-    const claimed = await this.db.query<{ id: string; channel_id: string; conversation_id: string }>(
+    const claimed = await this.db.query<{ id: string; organization_id: string; channel_id: string; conversation_id: string; epoch: number; ai_enabled: boolean }>(
       `WITH candidate AS (
-         SELECT j.id FROM reply_jobs j JOIN channels c ON c.id = j.channel_id
+         SELECT j.id, o.ai_enabled FROM reply_jobs j JOIN channels c ON c.id = j.channel_id
+         JOIN organizations o ON o.id = j.organization_id
          JOIN conversations cv ON cv.id = j.conversation_id
          WHERE j.state = 'pending' AND c.instance = $1 AND c.session = $2 AND cv.chat_id = $3
          ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED
-       ) UPDATE reply_jobs j SET state = 'sending', claimed_at = now()
-         FROM candidate WHERE j.id = candidate.id RETURNING j.id, j.channel_id, j.conversation_id`,
+       ) UPDATE reply_jobs j SET state = CASE WHEN candidate.ai_enabled THEN 'generating' ELSE 'sending' END,
+         claimed_at = now() FROM candidate WHERE j.id = candidate.id
+         RETURNING j.id, j.organization_id, j.channel_id, j.conversation_id, j.epoch, candidate.ai_enabled`,
       [settings.instance, settings.session, settings.chatId],
     );
     const job = claimed.rows[0];
     if (!job) return false;
+
+    let aiDecision: AIDecision | undefined;
+    let aiModel: string | undefined;
+    if (job.ai_enabled && this.aiProvider) {
+      const config = await this.db.query<{
+        company_name: string; ai_model: string; ai_business_data: Record<string, unknown>;
+        ai_tone: string; ai_instructions: string; mode: string; automation_epoch: number;
+        chat_id: string; active: boolean; organization_active: boolean; message: string; source_message_id: string;
+      }>(
+        `SELECT o.name AS company_name, o.ai_model, o.ai_business_data, o.ai_tone, o.ai_instructions,
+           cv.mode, cv.automation_epoch, cv.chat_id, c.active, o.active AS organization_active,
+           m.body AS message, j.source_message_id
+         FROM reply_jobs j JOIN organizations o ON o.id = j.organization_id
+         JOIN channels c ON c.id = j.channel_id AND c.organization_id = j.organization_id
+         JOIN conversations cv ON cv.id = j.conversation_id AND cv.organization_id = j.organization_id
+           AND cv.channel_id = j.channel_id
+         JOIN messages m ON m.id = j.source_message_id AND m.organization_id = j.organization_id
+           AND m.channel_id = j.channel_id AND m.conversation_id = j.conversation_id
+         WHERE j.id = $1 AND j.organization_id = $2 AND j.state = 'generating'`,
+        [job.id, job.organization_id],
+      );
+      const current = config.rows[0];
+      if (current) {
+        aiModel = current.ai_model;
+        try {
+          if (!current.active || !current.organization_active || current.mode !== 'auto'
+            || current.automation_epoch !== job.epoch || current.chat_id !== settings.chatId) {
+            throw new Error('AI job is no longer active');
+          }
+          const history = await this.db.query<{ direction: 'incoming' | 'outgoing'; body: string }>(
+            `SELECT direction, body FROM messages WHERE organization_id = $1 AND conversation_id = $2
+             AND received_at < (SELECT received_at FROM messages WHERE id = $3)
+             ORDER BY received_at DESC LIMIT 8`,
+            [job.organization_id, job.conversation_id, current.source_message_id],
+          );
+          const context: AIContext = {
+            companyName: current.company_name, businessData: current.ai_business_data,
+            tone: current.ai_tone, instructions: current.ai_instructions,
+            history: history.rows.reverse().map(item => ({ ...item, body: item.body.slice(0, 1_200) })),
+            message: current.message.slice(0, 4_000),
+          };
+          if (!this.aiProvider) throw new Error('AI provider unavailable');
+          aiDecision = await this.aiProvider.generate(context, current.ai_model);
+          if ((aiDecision.decision === 'reply' && (!aiDecision.reply.trim() || aiDecision.reply.length > 1_500 || aiDecision.handoffReason !== null))
+            || (aiDecision.decision === 'handoff' && (aiDecision.reply !== '' || !aiDecision.handoffReason))) {
+            throw new Error('AI provider returned an invalid decision');
+          }
+        } catch {
+          await this.finishAIFailure(job);
+          return true;
+        }
+      } else {
+        await this.finishAIFailure(job);
+        return true;
+      }
+      try {
+        await this.db.query(
+          `INSERT INTO ai_usage(reply_job_id, organization_id, model, input_tokens, output_tokens)
+           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (reply_job_id) DO NOTHING`,
+          [job.id, job.organization_id, aiModel, aiDecision.inputTokens, aiDecision.outputTokens],
+        );
+      } catch {
+        await this.finishAIFailure(job);
+        return true;
+      }
+    } else if (job.ai_enabled) {
+      // An opted-in company without a configured provider fails closed to a human.
+      await this.finishAIFailure(job);
+      return true;
+    }
+
     await this.db.transaction(async tx => {
       const channels = await tx.query<{ active: boolean; organization_id: string; instance: string; session: string }>(
         'SELECT active, organization_id, instance, session FROM channels WHERE id = $1 FOR UPDATE', [job.channel_id],
@@ -204,18 +278,27 @@ export class Store {
       const channel = channels.rows[0]!;
       const conversation = conversations.rows[0]!;
       const current = jobs.rows[0]!;
-      const organization = await tx.query<{ active: boolean }>('SELECT active FROM organizations WHERE id = $1', [channel.organization_id]);
-      if (current.state !== 'sending') return;
+      const organization = await tx.query<{ active: boolean; ai_enabled: boolean }>(
+        'SELECT active, ai_enabled FROM organizations WHERE id = $1 FOR UPDATE', [channel.organization_id]);
+      if (current.state !== (aiDecision ? 'generating' : 'sending')) return;
       if (!channel.active || !organization.rows[0]?.active || conversation.mode !== 'auto'
-        || conversation.automation_epoch !== current.epoch || !current.fresh
-        || channel.instance !== settings.instance || channel.session !== settings.session || conversation.chat_id !== settings.chatId) {
+        || conversation.automation_epoch !== current.epoch || current.epoch !== job.epoch || !current.fresh
+        || channel.instance !== settings.instance || channel.session !== settings.session || conversation.chat_id !== settings.chatId
+        || (aiDecision !== undefined && !organization.rows[0].ai_enabled)) {
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE id = $1", [job.id]);
+        return;
+      }
+      if (aiDecision?.decision === 'handoff') {
+        await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+          control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1`, [job.conversation_id]);
+        await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE id = $1", [job.id]);
+        await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
         return;
       }
       // No automatic retries after any network attempt: an error may hide a send.
       let result: { id: string };
       try {
-        result = await sender.send({ session: channel.session, chatId: conversation.chat_id, text: current.body });
+        result = await sender.send({ session: channel.session, chatId: conversation.chat_id, text: aiDecision?.reply ?? current.body });
       } catch (error) {
         const outcome = error instanceof SendError ? error.outcome : 'uncertain';
         await tx.query('UPDATE reply_jobs SET state = $1, completed_at = now() WHERE id = $2', [outcome, job.id]);
@@ -226,11 +309,30 @@ export class Store {
       await tx.query(
         `INSERT INTO messages(id, organization_id, channel_id, conversation_id, provider_message_id, direction, body)
          VALUES ($1,$2,$3,$4,$5,'outgoing',$6)`,
-        [randomUUID(), channel.organization_id, job.channel_id, job.conversation_id, result.id, current.body],
+        [randomUUID(), channel.organization_id, job.channel_id, job.conversation_id, result.id, aiDecision?.reply ?? current.body],
       );
       await tx.query("UPDATE reply_jobs SET state = 'sent', provider_message_id = $1, completed_at = now() WHERE id = $2", [result.id, job.id]);
     });
     return true;
+  }
+
+  private async finishAIFailure(job: { id: string; channel_id: string; conversation_id: string; epoch: number }): Promise<void> {
+    await this.db.transaction(async tx => {
+      await tx.query('SELECT id FROM channels WHERE id = $1 FOR UPDATE', [job.channel_id]);
+      await tx.query('SELECT id FROM conversations WHERE id = $1 FOR UPDATE', [job.conversation_id]);
+      const current = await tx.query<{ state: string; epoch: number }>(
+        'SELECT state, epoch FROM reply_jobs WHERE id = $1 FOR UPDATE', [job.id]);
+      if (current.rows[0]?.state !== 'generating') return;
+      await tx.query("UPDATE reply_jobs SET state = 'failed', completed_at = now() WHERE id = $1", [job.id]);
+      const conversation = await tx.query<{ mode: string; automation_epoch: number }>(
+        'SELECT mode, automation_epoch FROM conversations WHERE id = $1', [job.conversation_id]);
+      if (conversation.rows[0]?.mode === 'auto' && conversation.rows[0].automation_epoch === job.epoch
+        && current.rows[0].epoch === job.epoch) {
+        await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+          control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1`, [job.conversation_id]);
+        await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
+      }
+    });
   }
 
   async ready() { await this.db.query('SELECT 1'); }
