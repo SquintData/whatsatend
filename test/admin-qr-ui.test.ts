@@ -56,3 +56,27 @@ test('switching channels clears the old QR immediately and ignores a late QR res
   assert.equal(state.image.src, '');
   assert.deepEqual(state.revoked, ['blob:qr-a', 'blob:qr-b']);
 });
+
+test('conversation search discards an older channel response when requests finish out of order', async () => {
+  const start = adminPage.indexOf('function createConversationSearchGuard');
+  const end = adminPage.indexOf('\nfunction mountConversationHistory', start);
+  assert.ok(start >= 0 && end > start, 'admin UI must expose the conversation request guard');
+  const createGuard = runInNewContext(`(()=>{${adminPage.slice(start, end)};return createConversationSearchGuard})()`) as
+    () => { begin(key: string): unknown; isCurrent(request: unknown): boolean };
+  const guard = createGuard();
+  const rendered: string[] = [];
+  let resolveA!: (rows: string[]) => void;
+  let resolveB!: (rows: string[]) => void;
+  const responseA = new Promise<string[]>(resolve => { resolveA = resolve; });
+  const requestA = guard.begin('company-a/channel-a');
+  const renderA = responseA.then(rows => { if (guard.isCurrent(requestA)) rendered.push(...rows); });
+  const responseB = new Promise<string[]>(resolve => { resolveB = resolve; });
+  const requestB = guard.begin('company-b/channel-b');
+  const renderB = responseB.then(rows => { if (guard.isCurrent(requestB)) rendered.push(...rows); });
+
+  resolveB(['preview-from-b']);
+  await renderB;
+  resolveA(['preview-from-a']);
+  await renderA;
+  assert.deepEqual(rendered, ['preview-from-b']);
+});
