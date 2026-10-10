@@ -12,10 +12,37 @@ Node.js 22+, TypeScript, Fastify, PostgreSQL e WAHA/GOWS.
 - Novos contatos diretos elegiveis entram em `auto` na primeira mensagem recente; conversas `human` exigem retomada explicita.
 - Resposta manual muda para `human` e cancela os envios pendentes da conversa.
 - IDs retornados pela API identificam respostas próprias, que não ativam modo humano.
-- IA opcional por empresa; empresas sem IA mantêm a resposta fixa do piloto. Sem painel administrativo, campanhas ou envio de mídia nesta etapa.
+- IA opcional por empresa; empresas sem IA mantêm a resposta fixa do piloto. Painel interno protegido para operar empresas/canais e pareamento WhatsApp; sem CRM, campanhas ou envio de mídia.
 
 A resposta fixa é: “Olá! Recebemos sua mensagem. Este é um teste do atendimento automático.”
 Use `all` somente com autorizacao do cliente; a ativacao de cada canal e sempre explicita.
+
+## Painel interno e conexões WhatsApp
+
+Configure `ADMIN_SECRET` (mínimo 32 caracteres), `WAHA_BASE_URL`, `WAHA_API_KEY` e
+`PUBLIC_BASE_URL` (origem HTTPS pública do backend) no ambiente do backend. A chave
+WAHA e o segredo de webhook ficam somente no servidor. Sem `PUBLIC_BASE_URL`, o
+backend continua iniciando, mas o formulário de criação fica indisponível; sem URL
+e chave WAHA válidas, status, pareamento e ativação pelo painel ficam indisponíveis.
+O acesso administrativo deve passar por HTTPS.
+
+O painel lista os canais, cadastra empresa/sessão e configura a sessão WAHA pela API
+2026.9.2: `GET /api/sessions?all=true`, `POST /api/sessions` com `start:false`,
+`POST /api/sessions/{name}/start`, status em `GET /api/sessions/{name}` e QR em
+`GET /api/{name}/auth/qr`. A sessão recebe os webhooks `message.any`,
+`message.reaction` e `session.status`. Configure `WHATSAPP_DEFAULT_ENGINE=GOWS` no
+serviço WAHA; o engine é configuração geral do WAHA.
+
+O canal é criado com escopo `disabled`. O painel só permite ativar `test`/`all`
+depois de WAHA informar `WORKING` e `me.id`; `all` ainda exige confirmação explícita.
+O QR é servido sob autenticação enquanto o status é `SCAN_QR_CODE` e não é salvo no
+banco. A migração 005 mantém canais existentes e novos canais desativados até opt-in.
+
+O provisionamento atravessa WAHA e PostgreSQL sem transação distribuída: se WAHA
+criar a sessão parada e o `INSERT` falhar, a sessão pode ficar órfã em `STOPPED` e
+precisa ser reconciliada manualmente antes de reutilizar o nome. Se o início falhar
+depois do `INSERT`, o vínculo permanece no banco com escopo `disabled`; use “Iniciar
+sessão” no painel para tentar novamente. Nenhum endpoint de exclusão foi presumido.
 
 ## Desenvolvimento
 

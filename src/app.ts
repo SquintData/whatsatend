@@ -4,6 +4,7 @@ import { Store } from './store.js';
 import { directChat } from './automation.js';
 import type { Database } from './db.js';
 import { registerAdminPanel } from './admin.js';
+import type { WahaAdminClient } from './waha-admin.js';
 
 const envelopeSchema = z.object({
   event: z.string().min(1).max(100), session: z.string().min(1).max(200), payload: z.unknown().optional(),
@@ -22,7 +23,9 @@ const reactionSchema = z.object({
   reaction: z.object({ text: z.string().max(32).nullish().transform(value => value ?? ''), messageId: z.string().min(1).max(512) }),
 });
 
-export function buildApp(store: Store, logger = false, admin?: { db: Database; secret?: string }) {
+export function buildApp(store: Store, logger = false, admin?: {
+  db: Database; secret?: string; waha?: WahaAdminClient; publicBaseUrl?: string;
+}) {
   const app = Fastify({
     logger: logger ? {
       level: 'info',
@@ -39,7 +42,7 @@ export function buildApp(store: Store, logger = false, admin?: { db: Database; s
   });
   app.get('/health/live', async () => ({ status: 'ok' }));
   app.get('/health/ready', async () => { await store.ready(); return { status: 'ready' }; });
-  if (admin?.secret) registerAdminPanel(app, admin.db, admin.secret);
+  if (admin?.secret) registerAdminPanel(app, admin.db, admin.secret, admin);
 
   app.post<{ Params: { instance: string } }>('/webhooks/waha/:instance', async (request, reply) => {
     const token = request.headers['x-webhook-token'];
