@@ -16,7 +16,10 @@ export const adminPage = `<!doctype html><html lang="pt-BR"><meta charset="utf-8
 function createQrView(image,objectUrls=URL){let selectedKey='',generation=0,status='';const clear=()=>{image.hidden=true;const previous=image.dataset.url;if(previous){objectUrls.revokeObjectURL(previous);delete image.dataset.url}image.removeAttribute('src')};return{select(key){if(key===selectedKey)return;selectedKey=key;status='';generation++;clear()},updateStatus(key,next){if(key!==selectedKey)return false;status=next;if(next!=='SCAN_QR_CODE'){generation++;clear()}return true},async show(key,load){if(key!==selectedKey||status!=='SCAN_QR_CODE')return false;const current=++generation;clear();const blob=await load();if(key!==selectedKey||current!==generation||status!=='SCAN_QR_CODE')return false;const url=objectUrls.createObjectURL(blob);image.dataset.url=url;image.src=url;image.hidden=false;return true}}}
 const root=document.querySelector('#app');
 async function api(url,options={}){const method=(options.method||'GET').toUpperCase();const mutating=['POST','PUT','PATCH','DELETE'].includes(method);const response=await fetch(url,{...options,headers:{...(options.body?{'content-type':'application/json'}:{}),...options.headers,...(mutating?{'x-admin-action':'1'}:{})}});if(!response.ok)throw Error(response.status===401?'Sessão encerrada. Entre novamente.':'Operação não concluída. Confira os dados e tente outra vez.');return response.status===204?null:response.json()}
+function mountConversationHistory(){if(document.querySelector('#conversation-history'))return;const panel=document.createElement('section');panel.id='conversation-history';panel.className='panel';panel.innerHTML='<h2>Conversas e histórico</h2><form id="conversation-search" class="row"><label>Instância<input name="instance" required maxlength="100"></label><label>Sessão<input name="session" required maxlength="200"></label><button class="primary">Buscar conversas</button></form><p class="muted">Exibe até 25 conversas por página e até 100 mensagens ao abrir uma conversa. O histórico é limitado ao canal selecionado.</p><div id="conversation-list"></div><button id="conversation-next" type="button" hidden>Próxima página</button><section id="conversation-detail" hidden><h3 id="conversation-title"></h3><div id="conversation-messages"></div></section>';root.append(panel);let selection=null;let nextOffset=null;const list=document.querySelector('#conversation-list'),next=document.querySelector('#conversation-next');const load=async(offset=0,append=false)=>{const form=document.querySelector('#conversation-search');selection={instance:form.elements.instance.value.trim(),session:form.elements.session.value.trim()};try{const page=await api('/admin/api/conversations?'+new URLSearchParams({...selection,limit:'25',offset:String(offset)}));if(!append)list.replaceChildren();for(const item of page.items){const entry=document.createElement('div');entry.className='row';const summary=document.createElement('span');summary.textContent=item.company+' · '+item.chatId+' · '+item.mode+' · '+String(item.lastMessage||'Sem mensagens').slice(0,180);const open=document.createElement('button');open.type='button';open.textContent='Abrir histórico';open.dataset.conversationId=item.id;entry.append(summary,open);list.append(entry)}if(!page.items.length&&!append)list.textContent='Nenhuma conversa neste canal.';nextOffset=page.nextOffset;next.hidden=nextOffset===null;next.disabled=false;document.querySelector('#conversation-detail').hidden=true}catch{list.textContent='Não foi possível carregar conversas deste canal.';next.hidden=true}};document.querySelector('#conversation-search').onsubmit=event=>{event.preventDefault();void load()};next.onclick=()=>{if(nextOffset!==null){next.disabled=true;void load(nextOffset,true)}};list.addEventListener('click',async event=>{const button=event.target.closest('button[data-conversation-id]');if(!button||!selection)return;try{const detail=await api('/admin/api/conversation?'+new URLSearchParams({...selection,id:button.dataset.conversationId}));document.querySelector('#conversation-title').textContent=detail.company+' · '+detail.chatId+' · '+detail.mode;const messages=document.querySelector('#conversation-messages');messages.replaceChildren();for(const message of detail.messages){const item=document.createElement('p');item.textContent=(message.direction==='incoming'?'Contato':'Atendimento')+' · '+String(message.body);messages.append(item)}document.querySelector('#conversation-detail').hidden=false}catch{document.querySelector('#conversation-title').textContent='Não foi possível abrir este histórico.';document.querySelector('#conversation-detail').hidden=false}})}
+function mountConversationLinks(){const table=document.querySelector('#table');if(!table||table.dataset.historyLinks)return;table.dataset.historyLinks='true';const addLinks=()=>{for(const row of table.querySelectorAll('tbody tr')){const controls=row.lastElementChild;if(!controls||controls.querySelector('[data-history-channel]'))continue;const pair=(row.cells[1]?.textContent||'').split(' / ');if(pair.length!==2)continue;const button=document.createElement('button');button.type='button';button.textContent='Conversas';button.dataset.historyChannel='true';button.onclick=()=>{const form=document.querySelector('#conversation-search');form.elements.instance.value=pair[0].trim();form.elements.session.value=pair[1].trim();form.requestSubmit()};controls.append(button)}};new MutationObserver(addLinks).observe(table,{childList:true,subtree:true});addLinks()}
 function notice(text){const n=document.querySelector('#notice');if(n)n.textContent=text}
+const dashboardObserver=new MutationObserver(()=>{if(document.querySelector('#create-channel')){mountConversationHistory();mountConversationLinks()}});dashboardObserver.observe(root,{childList:true});
 function login(){root.innerHTML='<h1>WhatsAtend · Operação interna</h1><section class="panel"><h2>Entrar</h2><form id="login"><label>Segredo administrativo<input id="secret" type="password" autocomplete="current-password" required minlength="32"></label><button class="primary">Entrar</button><p id="notice" role="status"></p></form></section>';document.querySelector('#login').onsubmit=async e=>{e.preventDefault();const field=document.querySelector('#secret');const secret=field.value;field.value='';try{await api('/admin/api/login',{method:'POST',body:JSON.stringify({secret})});await dashboard()}catch{notice('Acesso negado. Verifique o segredo administrativo.')}}}
 async function dashboard(){root.innerHTML='<header class="row"><h1>Empresas e canais</h1><button id="logout">Sair</button></header><p class="muted">Configurações são isoladas por empresa. O escopo disabled pausa o canal; conversas em atendimento humano permanecem pausadas.</p><section class="panel"><h2>Cadastrar empresa e canal</h2><form id="create-channel"><div class="row"><label>Instância do webhook<input name="instance" required maxlength="100" pattern="[A-Za-z0-9_-]+" value="principal"></label><label>Sessão WAHA<input name="session" required maxlength="100" pattern="[A-Za-z0-9_-]+"></label><label>Empresa<input name="company" required maxlength="200"></label></div><button class="primary">Criar e iniciar sessão</button><p id="create-notice" role="status"></p></form><p class="muted">A sessão nasce com automação desativada. O segredo do webhook é gerado no backend e não é exibido.</p></section><section class="panel"><div class="row"><h2>Canais cadastrados</h2><button id="refresh">Atualizar</button></div><div id="table"></div></section><section class="panel" id="editor" hidden><h2 id="title">Configuração</h2><form id="ai"><label><input id="enabled" type="checkbox"> IA habilitada para a empresa</label><label>Modelo<input id="model" required maxlength="100"></label><label>Dados da empresa (JSON)<textarea id="data" maxlength="10000" spellcheck="false"></textarea></label><label>Tom<textarea id="tone" maxlength="300"></textarea></label><label>Instruções<textarea id="instructions" maxlength="2000"></textarea></label><button class="primary">Salvar configuração da IA</button></form><hr><form id="scope"><label>Escopo do canal<select id="scope-value"><option value="disabled">Desativado</option><option value="test">Teste · contato exato</option><option value="all">Todos os contatos diretos</option></select></label><label id="test-row">ID exato para teste<input id="test-chat" maxlength="255" placeholder="5511999999999@c.us"></label><label id="all-row"><input id="confirm-all" type="checkbox"> Confirmo ativação para todos os contatos diretos deste canal</label><button class="primary">Aplicar escopo</button></form><p id="notice" role="status"></p></section><p class="muted">O painel nunca exibe tokens de webhook ou a chave WAHA.</p></main>';
 let selected=null;const refresh=async()=>{try{const rows=await api('/admin/api/channels');const table=document.querySelector('#table');table.replaceChildren();if(!rows.length){table.textContent='Nenhuma empresa/canal cadastrado.';return}const t=document.createElement('table');t.innerHTML='<thead><tr><th>Empresa</th><th>Instância / sessão</th><th>Ativa</th><th>IA</th><th>Escopo</th><th></th></tr></thead>';const body=document.createElement('tbody');for(const row of rows){const tr=document.createElement('tr');for(const value of [row.company,row.instance+' / '+row.session,row.organizationActive&&row.channelActive?'sim':'não',row.aiEnabled?'ativa':'desativada',row.scope]){const td=document.createElement('td');td.textContent=String(value);tr.append(td)}const td=document.createElement('td'),button=document.createElement('button');button.textContent='Configurar';button.onclick=()=>open(row.instance,row.session);const connect=document.createElement('button');connect.textContent='Conexão';connect.onclick=()=>showConnection(row.instance,row.session);td.append(button,connect);tr.append(td);body.append(tr)}t.append(body);table.append(t)}catch{login()}};
@@ -26,6 +29,11 @@ login();
 </script></html>`;
 
 const mappingSchema = z.object({ instance: z.string().min(1).max(100), session: z.string().min(1).max(200) }).strict();
+const conversationsQuerySchema = mappingSchema.extend({
+  limit: z.coerce.number().int().min(1).max(50).default(25),
+  offset: z.coerce.number().int().min(0).max(10_000).default(0),
+}).strict();
+const conversationQuerySchema = mappingSchema.extend({ id: z.string().uuid() }).strict();
 const loginSchema = z.object({ secret: z.string().min(1).max(256) }).strict();
 const scopeSchema = mappingSchema.extend({
   scope: z.enum(['disabled', 'test', 'all']), testChatId: z.string().max(255).optional(), confirmAll: z.boolean().optional(),
@@ -97,6 +105,64 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
   app.get('/admin/api/channels', async (request, reply) => {
     headers(reply); if (!guard(request, reply)) return;
     try { return await listCompanies(db); } catch { return reject(reply, 503); }
+  });
+  app.get('/admin/api/conversations', async (request, reply) => {
+    headers(reply); if (!guard(request, reply)) return;
+    const parsed = conversationsQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reject(reply, 400);
+    const { instance, session, limit, offset } = parsed.data;
+    try {
+      const result = await db.query<{
+        id: string; company: string; chat_id: string; mode: string; created_at: Date;
+        latest_message_at: Date | null; last_direction: string | null; last_message: string | null;
+      }>(`SELECT cv.id, o.name AS company, cv.chat_id, cv.mode, cv.created_at,
+          latest.received_at AS latest_message_at, latest.direction AS last_direction, latest.body AS last_message
+        FROM channels ch
+        JOIN organizations o ON o.id = ch.organization_id
+        JOIN conversations cv ON cv.organization_id = ch.organization_id AND cv.channel_id = ch.id
+        LEFT JOIN LATERAL (
+          SELECT m.received_at, m.direction, m.body FROM messages m
+          WHERE m.organization_id = ch.organization_id AND m.channel_id = ch.id AND m.conversation_id = cv.id
+          ORDER BY m.received_at DESC, m.id DESC LIMIT 1
+        ) latest ON true
+        WHERE ch.instance = $1 AND ch.session = $2
+        ORDER BY latest.received_at DESC NULLS LAST, cv.created_at DESC, cv.id DESC
+        LIMIT $3 OFFSET $4`, [instance, session, limit + 1, offset]);
+      const hasMore = result.rows.length > limit;
+      const items = result.rows.slice(0, limit).map(row => ({
+        id: row.id, company: row.company, chatId: row.chat_id, mode: row.mode,
+        latestAt: row.latest_message_at ?? row.created_at,
+        lastDirection: row.last_direction, lastMessage: row.last_message,
+      }));
+      return { items, nextOffset: hasMore ? offset + limit : null };
+    } catch { return reject(reply, 503); }
+  });
+  app.get('/admin/api/conversation', async (request, reply) => {
+    headers(reply); if (!guard(request, reply)) return;
+    const parsed = conversationQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reject(reply, 400);
+    const { instance, session, id } = parsed.data;
+    try {
+      const channel = await db.query<{ id: string; organization_id: string }>(
+        'SELECT id, organization_id FROM channels WHERE instance = $1 AND session = $2', [instance, session]);
+      const scopedChannel = channel.rows[0];
+      if (!scopedChannel) return reject(reply, 404);
+      const conversation = await db.query<{ id: string; company: string; chat_id: string; mode: string }>(
+        `SELECT cv.id, o.name AS company, cv.chat_id, cv.mode
+        FROM conversations cv JOIN organizations o ON o.id = cv.organization_id
+        WHERE cv.id = $1 AND cv.organization_id = $2 AND cv.channel_id = $3`,
+        [id, scopedChannel.organization_id, scopedChannel.id]);
+      const row = conversation.rows[0];
+      if (!row) return reject(reply, 404);
+      const messages = await db.query<{ direction: string; body: string; provider_timestamp: string | null; received_at: Date }>(
+        `SELECT m.direction, m.body, m.provider_timestamp, m.received_at FROM messages m
+        WHERE m.organization_id = $1 AND m.channel_id = $2 AND m.conversation_id = $3
+        ORDER BY m.received_at DESC, m.id DESC LIMIT 100`,
+        [scopedChannel.organization_id, scopedChannel.id, row.id]);
+      return { id: row.id, company: row.company, chatId: row.chat_id, mode: row.mode,
+        messages: messages.rows.reverse().map(message => ({ direction: message.direction, body: message.body,
+          timestamp: message.provider_timestamp, receivedAt: message.received_at })) };
+    } catch { return reject(reply, 503); }
   });
   const channelForConnection = async (instance: string, session: string) => {
     const result = await db.query<{ id: string }>(
