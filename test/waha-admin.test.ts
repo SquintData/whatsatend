@@ -41,6 +41,16 @@ test('WAHA admin uses only documented session endpoints and keeps its API key se
   assert.deepEqual(createBody.config.webhooks[0].customHeaders, { 'X-Webhook-Token': 'a'.repeat(64) });
 });
 
+test('WAHA status accepts the real engine metadata object and normalizes it without exposing metadata', async () => {
+  const client = new WahaAdminClient({ baseUrl: 'http://waha.local', apiKey: 'test-api-key-'.padEnd(40, 'x') }, async () =>
+    Response.json({ name: 'fixture-session', status: 'WORKING',
+      engine: { engine: 'GOWS', grpc: { internal: 'ignored' }, gows: { internal: 'ignored' } },
+      me: { id: 'fixture-account' } }));
+  const status = await client.sessionStatus('fixture-session');
+  assert.deepEqual(status, { status: 'WORKING', engine: 'GOWS', account: 'fixture-account' });
+  assert.equal(Object.keys(status).join(','), 'status,engine,account');
+});
+
 test('WAHA admin rejects non-PNG or oversized QR data and does not log response contents', async () => {
   const invalid = new WahaAdminClient({ baseUrl: 'http://waha.local', apiKey: 'secret-api-key-'.padEnd(40, 'x') }, async () =>
     new Response('not a png', { headers: { 'content-type': 'text/plain' } }));
