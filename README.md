@@ -154,6 +154,51 @@ nao voltam ao automatico por novas mensagens; e preciso retomada explicita ou
 reacao valida no mesmo canal, sob seu escopo atual. Novos contatos diretos
 compativeis iniciam no automatico na primeira mensagem recente do canal opt-in.
 
+## Operação interna de empresas
+
+Use a CLI local do operador depois de `npm run build`; ela requer `DATABASE_URL` e
+as migrações atuais. Não há interface web: o servidor público atende webhooks, e
+esta versão não inclui autenticação de operador para rotas administrativas.
+
+Crie uma empresa e seu canal com um arquivo JSON protegido fora do repositório:
+
+```json
+{
+  "name": "Empresa Exemplo",
+  "instance": "principal",
+  "session": "cliente-2",
+  "webhookToken": "<64 caracteres hex aleatórios>",
+  "ai": {
+    "enabled": false,
+    "model": "gpt-4o-mini",
+    "businessData": { "address": "Rua Exemplo, 10", "faqs": [] },
+    "tone": "Natural e cordial",
+    "instructions": "Não invente informações."
+  }
+}
+```
+
+```bash
+npm run company:admin -- list
+npm run company:admin -- create /caminho/protegido/empresa.json
+```
+
+O canal nasce `disabled` e a IA desligada por padrão. `configure` atualiza os
+dados de IA da empresa mapeada ao canal; `scope` opta o canal em `test` (ID direto
+exato) ou `all` (conversas diretas), e `disabled` pausa com cancelamento da fila:
+
+```bash
+npm run company:admin -- configure principal cliente-2 /caminho/protegido/ia.json
+npm run company:admin -- scope principal cliente-2 test 5511999999999@c.us
+npm run company:admin -- scope principal cliente-2 all --confirm-all
+npm run company:admin -- scope principal cliente-2 disabled
+```
+
+`all` exige a confirmação literal `--confirm-all`. Desativar encerra o modo
+automático do canal sem retomar conversas `human`; a pausa humana e o kill switch
+global continuam prevalecendo. Mantenha arquivos com token/dados fora do Git e
+configure `OPENAI_API_KEY` somente no ambiente do backend.
+
 ## Ativação da resposta fixa
 
 Primeiro identificar a conversa do contato de teste no PostgreSQL:
