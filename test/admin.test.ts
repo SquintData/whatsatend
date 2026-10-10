@@ -142,6 +142,71 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /Cadastrar empresa e canal/);
   assert.match(adminPage, /Conexão/);
   assert.match(adminPage, /Exibir QR de pareamento/);
+  assert.match(adminPage, /Conversas e histórico/);
+  assert.match(adminPage, /Abrir histórico/);
+  assert.match(adminPage, /admin\/api\/conversations/);
+});
+
+test('conversation history requires admin auth and isolates same chat across companies and channels', async () => {
+  const f = await fixture();
+  const webhookToken = 'c'.repeat(64);
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Hist A', instance: 'principal', session: 'a', webhookToken })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Hist B', instance: 'principal', session: 'b', webhookToken: 'e'.repeat(64) })));
+    const channels = (await f.pg.query<{ id: string; organization_id: string; session: string }>(
+      'SELECT id, organization_id, session FROM channels ORDER BY session')).rows;
+    const conversationIds = [randomUUID(), randomUUID()];
+    for (let i = 0; i < channels.length; i++) {
+      const channel = channels[i]!;
+      await f.pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode)
+        VALUES ($1,$2,$3,'same-contact@c.us',$4)`,
+        [conversationIds[i], channel.organization_id, channel.id, i === 0 ? 'human' : 'monitoring']);
+      await f.pg.query(`INSERT INTO messages(id,organization_id,channel_id,conversation_id,provider_message_id,direction,body,provider_timestamp)
+        VALUES ($1,$2,$3,$4,$5,'incoming',$6,1700000000)`,
+        [randomUUID(), channel.organization_id, channel.id, conversationIds[i], `history-${i}`, `private-message-${i}`]);
+    }
+    await f.pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode,created_at)
+      VALUES ($1,$2,$3,'another-contact@c.us','monitoring','2000-01-01T00:00:00Z')`,
+      [randomUUID(), channels[0]!.organization_id, channels[0]!.id]);
+
+    f.resetQueryCount();
+    assert.equal((await f.app.inject('/admin/api/conversations?instance=principal&session=a')).statusCode, 401);
+    assert.equal((await f.app.inject(`/admin/api/conversation?instance=principal&session=a&id=${conversationIds[0]}`)).statusCode, 401);
+    assert.equal(f.queryCount(), 0, 'unauthenticated history reads must not query database');
+
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]! };
+    const pageA = await f.app.inject({ url: '/admin/api/conversations?instance=principal&session=a&limit=1&offset=0', headers });
+    assert.equal(pageA.statusCode, 200);
+    assert.equal(pageA.json().items.length, 1);
+    assert.notEqual(pageA.json().items[0].id, conversationIds[1], 'selected channel page must exclude another company');
+    assert.ok(['human', 'monitoring'].includes(pageA.json().items[0].mode));
+    assert.equal(pageA.json().items[0].chatId, 'same-contact@c.us');
+    assert.equal(pageA.json().nextOffset, 1, 'limit + 1 query indicates a next page');
+    assert.equal(JSON.stringify(pageA.json()).includes(webhookToken), false);
+
+    const pageANext = await f.app.inject({ url: '/admin/api/conversations?instance=principal&session=a&limit=1&offset=1', headers });
+    assert.equal(pageANext.statusCode, 200);
+    assert.notEqual(pageANext.json().items[0].id, conversationIds[1]);
+    assert.notEqual(pageANext.json().items[0].id, pageA.json().items[0].id);
+    assert.equal(pageANext.json().nextOffset, null);
+
+    const historyA = await f.app.inject({ url: `/admin/api/conversation?instance=principal&session=a&id=${conversationIds[0]}`, headers });
+    assert.equal(historyA.statusCode, 200);
+    assert.deepEqual(historyA.json().messages.map((message: { body: string }) => message.body), ['private-message-0']);
+    const crossChannel = await f.app.inject({ url: `/admin/api/conversation?instance=principal&session=a&id=${conversationIds[1]}`, headers });
+    assert.equal(crossChannel.statusCode, 404);
+
+    const pageB = await f.app.inject({ url: '/admin/api/conversations?instance=principal&session=b&limit=1&offset=0', headers });
+    assert.equal(pageB.statusCode, 200);
+    assert.equal(pageB.json().items[0].id, conversationIds[1]);
+    assert.equal(pageB.json().items[0].mode, 'monitoring');
+    const historyB = await f.app.inject({ url: `/admin/api/conversation?instance=principal&session=b&id=${conversationIds[1]}`, headers });
+    assert.deepEqual(historyB.json().messages.map((message: { body: string }) => message.body), ['private-message-1']);
+    assert.equal((await f.app.inject({ url: '/admin/api/conversations?instance=principal&session=a&limit=500', headers })).statusCode, 400);
+  } finally { await f.close(); }
 });
 
 test('admin panel is not mounted without an environment secret and mutations require same-site action header', async () => {
