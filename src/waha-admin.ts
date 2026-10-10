@@ -64,10 +64,14 @@ export class WahaAdminClient {
   async sessionStatus(name: string): Promise<WahaSessionStatus> {
     sessionName.parse(name);
     const body: unknown = await (await this.request(`/api/sessions/${encodeURIComponent(name)}`)).json();
-    const parsed = z.object({ status: z.string().min(1).max(100), engine: z.string().max(100).nullish(),
+    const parsed = z.object({ status: z.string().min(1).max(100),
+      engine: z.union([z.string().max(100), z.record(z.enum(['engine', 'grpc', 'gows']), z.unknown())]).nullish(),
       me: z.object({ id: z.string().max(255).optional() }).nullish() }).safeParse(body);
     if (!parsed.success) throw apiFailure();
-    return { status: parsed.data.status, engine: parsed.data.engine ?? null, account: parsed.data.me?.id ?? null };
+    const engine = typeof parsed.data.engine === 'string' ? parsed.data.engine
+      : typeof parsed.data.engine?.engine === 'string' && parsed.data.engine.engine.length <= 100
+        ? parsed.data.engine.engine : null;
+    return { status: parsed.data.status, engine, account: parsed.data.me?.id ?? null };
   }
 
   async qrPng(name: string): Promise<Uint8Array> {
