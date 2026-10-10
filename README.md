@@ -156,9 +156,19 @@ compativeis iniciam no automatico na primeira mensagem recente do canal opt-in.
 
 ## Operação interna de empresas
 
-Use a CLI local do operador depois de `npm run build`; ela requer `DATABASE_URL` e
-as migrações atuais. Não há interface web: o servidor público atende webhooks, e
-esta versão não inclui autenticação de operador para rotas administrativas.
+O painel interno fica em `/admin`. Defina `ADMIN_SECRET` no ambiente do backend
+com pelo menos 32 caracteres aleatórios; sem ele as rotas administrativas não
+são montadas. Acesse somente por HTTPS: a sessão usa cookie `Secure`, `HttpOnly`,
+`SameSite=Strict`, expira em 8 horas e é invalidada quando o processo reinicia.
+O segredo é validado em tempo constante, há limite de tentativas, e o painel não
+retorna nem registra tokens de webhook. Use o painel para listar canais, editar
+dados/instruções da IA e escolher `disabled`, `test` ou `all`; `all` requer
+confirmação explícita. Desativar cancela a fila e mantém conversas humanas pausadas.
+
+O cadastro inicial de empresa/canal continua pela CLI local depois de
+`npm run build`; ela requer `DATABASE_URL` e as migrações atuais. O painel não
+cria novos canais nesta fatia. Para vincular o webhook de uma nova empresa, use
+o token protegido criado no fluxo da CLI, nunca copie segredos para páginas/logs.
 
 Crie uma empresa e seu canal com um arquivo JSON protegido fora do repositório:
 

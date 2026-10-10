@@ -2,6 +2,8 @@ import Fastify from 'fastify';
 import { z } from 'zod';
 import { Store } from './store.js';
 import { directChat } from './automation.js';
+import type { Database } from './db.js';
+import { registerAdminPanel } from './admin.js';
 
 const envelopeSchema = z.object({
   event: z.string().min(1).max(100), session: z.string().min(1).max(200), payload: z.unknown().optional(),
@@ -20,11 +22,11 @@ const reactionSchema = z.object({
   reaction: z.object({ text: z.string().max(32).nullish().transform(value => value ?? ''), messageId: z.string().min(1).max(512) }),
 });
 
-export function buildApp(store: Store, logger = false) {
+export function buildApp(store: Store, logger = false, admin?: { db: Database; secret?: string }) {
   const app = Fastify({
     logger: logger ? {
       level: 'info',
-      redact: ['req.headers.authorization', 'req.headers["x-webhook-token"]', 'req.headers["x-api-key"]'],
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-webhook-token"]', 'req.headers["x-api-key"]'],
     } : false,
     disableRequestLogging: true, bodyLimit: 256 * 1024,
   });
@@ -37,6 +39,7 @@ export function buildApp(store: Store, logger = false) {
   });
   app.get('/health/live', async () => ({ status: 'ok' }));
   app.get('/health/ready', async () => { await store.ready(); return { status: 'ready' }; });
+  if (admin?.secret) registerAdminPanel(app, admin.db, admin.secret);
 
   app.post<{ Params: { instance: string } }>('/webhooks/waha/:instance', async (request, reply) => {
     const token = request.headers['x-webhook-token'];
