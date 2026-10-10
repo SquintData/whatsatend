@@ -80,3 +80,35 @@ test('conversation search discards an older channel response when requests finis
   await renderA;
   assert.deepEqual(rendered, ['preview-from-b']);
 });
+
+test('conversation detail discards a prior channel response after the selected channel changes', async () => {
+  const mountStart = adminPage.indexOf('function mountConversationHistory');
+  const mountEnd = adminPage.indexOf('\nfunction mountConversationLinks', mountStart);
+  assert.ok(mountStart >= 0 && mountEnd > mountStart);
+  const mount = adminPage.slice(mountStart, mountEnd);
+  const detailFetch = mount.indexOf("await api('/admin/api/conversation?");
+  const detailCheck = mount.indexOf('detailGuard.isCurrent(detailRequest)');
+  assert.ok(detailCheck > detailFetch, 'detail rendering must verify the current channel/conversation request after fetch');
+  const start = adminPage.indexOf('function createConversationSearchGuard');
+  const end = adminPage.indexOf('\nfunction mountConversationHistory', start);
+  assert.ok(start >= 0 && end > start, 'admin UI must expose the conversation request guard');
+  const createGuard = runInNewContext(`(()=>{${adminPage.slice(start, end)};return createConversationSearchGuard})()`) as
+    () => { begin(key: string): unknown; isCurrent(request: unknown): boolean };
+  const detailGuard = createGuard();
+  const rendered: string[] = [];
+  let resolveA!: (rows: string[]) => void;
+  let resolveB!: (rows: string[]) => void;
+  const responseA = new Promise<string[]>(resolve => { resolveA = resolve; });
+  const requestA = detailGuard.begin(JSON.stringify(['company-a', 'channel-a', 'conversation-a']));
+  const renderA = responseA.then(rows => { if (detailGuard.isCurrent(requestA)) rendered.push(...rows); });
+
+  detailGuard.begin(JSON.stringify(['company-b', 'channel-b']));
+  const responseB = new Promise<string[]>(resolve => { resolveB = resolve; });
+  const requestB = detailGuard.begin(JSON.stringify(['company-b', 'channel-b', 'conversation-b']));
+  const renderB = responseB.then(rows => { if (detailGuard.isCurrent(requestB)) rendered.push(...rows); });
+  resolveB(['detail-from-b']);
+  await renderB;
+  resolveA(['detail-from-a']);
+  await renderA;
+  assert.deepEqual(rendered, ['detail-from-b']);
+});
