@@ -27,7 +27,7 @@ async function fixture(withAdmin = true) {
   let manualSendStatus = 200;
   const wahaSessions = new Set<string>();
   const wahaCalls: Array<{ url: string; init: RequestInit }> = [];
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql', '010_ai_handoff_attention.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -442,6 +442,51 @@ test('attention queue is admin-only, tenant-labeled, recent, bounded and exclude
     assert.equal(response.body.includes('token_hash'), false);
     assert.equal(report.items.some((item: { conversationId: string }) => item.conversationId === records[53]!.conversationId), false,
       'sent jobs are not part of the attention queue');
+  } finally { await f.close(); }
+});
+
+test('attention queue includes only explicit AI handoffs, isolated by company, and removes them after resume', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Handoff A', instance: 'principal', session: 'handoff-a', webhookToken: 'a'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Handoff B', instance: 'principal', session: 'handoff-b', webhookToken: 'b'.repeat(64) })));
+    const channels = (await f.pg.query<{ id: string; organization_id: string; instance: string; session: string }>(
+      'SELECT id, organization_id, instance, session FROM channels ORDER BY session')).rows;
+    const conversations = [randomUUID(), randomUUID(), randomUUID()];
+    const handoffAt = new Date('2026-09-02T10:00:00.000Z');
+    for (let index = 0; index < 3; index++) {
+      const channel = channels[index === 0 ? 0 : 1]!;
+      await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id, mode, ai_handoff_reason, ai_handoff_at)
+        VALUES ($1,$2,$3,$4,'human',$5,$6)`, [
+        conversations[index], channel.organization_id, channel.id, `handoff-${index}@c.us`,
+        index < 2 ? index === 0 ? 'needs_person' : 'sensitive_request' : null,
+        index < 2 ? new Date(handoffAt.getTime() + index * 1000) : null,
+      ]);
+    }
+    await new Store(f.db).pauseConversation('principal', 'handoff-b', conversations[2]!);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test', origin: 'https://admin.test' };
+    const response = await f.app.inject({ method: 'GET', url: '/admin/api/attention', headers });
+    assert.equal(response.statusCode, 200);
+    const items = response.json().items;
+    assert.deepEqual(items.map((item: { conversationId: string }) => item.conversationId), [conversations[1], conversations[0]]);
+    assert.equal(items[0].status, 'ai_handoff');
+    assert.equal(items[0].organization, 'Handoff B');
+    assert.equal(items[0].session, 'handoff-b');
+    assert.equal(items[0].attentionAt, new Date(handoffAt.getTime() + 1000).toISOString());
+    assert.equal(items[0].reason, 'sensitive_request');
+    assert.equal(items[1].status, 'ai_handoff');
+    assert.equal(items[1].organization, 'Handoff A');
+    assert.equal(items[1].session, 'handoff-a');
+    assert.equal(items.some((item: { conversationId: string }) => item.conversationId === conversations[2]), false,
+      'human mode without the AI handoff marker is not a queue item');
+    assert.equal(response.body.includes('handoffReason'), false);
+
+    await f.pg.query(`UPDATE conversations SET mode = 'auto', ai_handoff_reason = NULL, ai_handoff_at = NULL WHERE id = $1`, [conversations[0]]);
+    const resumed = await f.app.inject({ method: 'GET', url: '/admin/api/attention', headers });
+    assert.deepEqual(resumed.json().items.map((item: { conversationId: string }) => item.conversationId), [conversations[1]]);
   } finally { await f.close(); }
 });
 

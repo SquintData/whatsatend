@@ -138,6 +138,12 @@ test('attention queue renders untrusted tenant/channel values as text and links 
   const empty = documentRef.createElement('div');
   create([], empty, () => {}, documentRef);
   assert.match(empty.textContent, /Sem itens que precisem de aten/);
+
+  const handoffTarget = documentRef.createElement('div');
+  create([{ ...item, status: 'ai_handoff', reason: malicious }], handoffTarget, () => {}, documentRef);
+  const handoffNodes = flatten(handoffTarget);
+  assert.ok(handoffNodes.some(node => node.textContent === `Handoff IA · ${malicious}`), 'handoff reason is rendered as text');
+  assert.equal(handoffNodes.some(node => node.tagName === 'img'), false);
 });
 
 interface FakeElement {
