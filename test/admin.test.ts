@@ -27,7 +27,7 @@ async function fixture(withAdmin = true) {
   let manualSendStatus = 200;
   const wahaSessions = new Set<string>();
   const wahaCalls: Array<{ url: string; init: RequestInit }> = [];
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -576,6 +576,33 @@ test('concurrent channel onboarding reserves the session before only one WAHA cr
     assert.equal((await f.pg.query('SELECT id FROM organizations')).rows.length, 1);
     assert.equal((await f.pg.query('SELECT instance FROM channel_onboarding_claims')).rows.length, 0);
   } finally { releaseCreate?.(); await f.close(); }
+});
+
+test('onboarding rejects a WAHA session already assigned through another instance or the CLI', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'CLI Company', instance: 'cli-instance',
+      session: 'shared-session', webhookToken: 'c'.repeat(64) })));
+    const originHeaders = { host: 'admin.test', origin: 'https://admin.test' };
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: originHeaders,
+      payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { ...originHeaders, cookie: String(login.headers['set-cookie']).split(';')[0]!, 'x-admin-action': '1' };
+    const response = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+      payload: { company: 'Panel Company', instance: 'ui-instance', session: 'shared-session' } });
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(response.json(), { error: 'channel_already_registered' });
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sessions')).length, 0,
+      'a persisted mapping from any instance must block WAHA mutation');
+    assert.deepEqual((await f.pg.query('SELECT name FROM organizations')).rows, [{ name: 'CLI Company' }]);
+    assert.deepEqual((await f.pg.query('SELECT instance, session FROM channels')).rows,
+      [{ instance: 'cli-instance', session: 'shared-session' }]);
+    await assert.rejects(createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Second CLI Company',
+      instance: 'another-cli-instance', session: 'shared-session', webhookToken: 'd'.repeat(64) }))),
+    /WAHA session is already assigned/);
+    await assert.rejects(f.pg.query(`INSERT INTO channels(id, organization_id, instance, session, token_hash)
+      SELECT $1, organization_id, 'direct-db-instance', session, $2 FROM channels WHERE session = $3`,
+      [randomUUID(), tokenHash('e'.repeat(64)), 'shared-session']));
+  } finally { await f.close(); }
 });
 
 test('failed WAHA session creation releases its onboarding reservation for retry', async () => {

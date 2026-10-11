@@ -11,7 +11,7 @@ import { tokenHash } from '../src/store.js';
 
 async function fixture() {
   const pg = new PGlite();
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -70,6 +70,32 @@ test('operator onboarding creates isolated company/channel defaults, configures 
     assert.equal((await f.pg.query('SELECT state FROM reply_jobs')).rows[0]!.state, 'cancelled');
     assert.equal((await f.pg.query<{ automation_scope: string }>('SELECT automation_scope FROM channels')).rows[0]!.automation_scope, 'disabled');
   } finally { await f.pg.close(); }
+});
+
+test('global WAHA session migration fails explicitly without changing preexisting duplicate mappings', async () => {
+  const pg = new PGlite();
+  try {
+    for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql',
+      '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql',
+      '008_channel_onboarding_claim.sql']) {
+      await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
+    }
+    const organizations = [randomUUID(), randomUUID()];
+    await pg.query('INSERT INTO organizations(id, name) VALUES ($1, $3), ($2, $4)',
+      [organizations[0], organizations[1], 'Duplicate A', 'Duplicate B']);
+    await pg.query(`INSERT INTO channels(id, organization_id, instance, session, token_hash)
+      VALUES ($1, $2, 'instance-a', 'shared-session', $3), ($4, $5, 'instance-b', 'shared-session', $6)`,
+      [randomUUID(), organizations[0], tokenHash('a'.repeat(64)), randomUUID(), organizations[1], tokenHash('b'.repeat(64))]);
+
+    await assert.rejects(pg.exec(await readFile(new URL('../sql/009_global_waha_session_unique.sql', import.meta.url), 'utf8')),
+      /Cannot enforce global WAHA session uniqueness while duplicate channel sessions exist/);
+    const remaining = await pg.query<{ instance: string; session: string }>(
+      'SELECT instance, session FROM channels ORDER BY instance');
+    assert.deepEqual(remaining.rows, [
+      { instance: 'instance-a', session: 'shared-session' },
+      { instance: 'instance-b', session: 'shared-session' },
+    ]);
+  } finally { await pg.close(); }
 });
 
 test('onboarding rejects invalid tokens and oversized business data', () => {
