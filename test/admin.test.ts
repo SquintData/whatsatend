@@ -296,6 +296,68 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /admin\/api\/conversation\/pause/);
   assert.match(adminPage, /admin\/api\/conversation\/reply/);
   assert.match(adminPage, /Enviar resposta manual/);
+  assert.match(adminPage, /Consumo de IA/);
+  assert.match(adminPage, /\/admin\/api\/ai-usage/);
+  assert.match(adminPage, /Tokens de entrada/);
+  assert.match(adminPage, /Tokens de sa[ií]da/);
+});
+
+test('AI usage is admin-only, isolated by company, includes zero-use companies and filters the current UTC month', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa A', instance: 'principal', session: 'usage-a', webhookToken: 'a'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa B', instance: 'principal', session: 'usage-b', webhookToken: 'b'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Sem uso', instance: 'principal', session: 'usage-zero', webhookToken: 'c'.repeat(64) })));
+    const channels = await f.pg.query<{ id: string; organization_id: string; session: string }>(
+      'SELECT id, organization_id, session FROM channels ORDER BY session');
+    const bySession = new Map(channels.rows.map(channel => [channel.session, channel]));
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const previousMonth = new Date(monthStart.getTime() - 1_000);
+    const recordUsage = async (session: string, createdAt: Date, inputTokens: number, outputTokens: number) => {
+      const channel = bySession.get(session)!;
+      const conversationId = randomUUID();
+      const messageId = randomUUID();
+      const jobId = randomUUID();
+      await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id)
+        VALUES ($1,$2,$3,$4)`, [conversationId, channel.organization_id, channel.id, `${conversationId}@c.us`]);
+      await f.pg.query(`INSERT INTO messages(id, organization_id, channel_id, conversation_id, provider_message_id, direction, body)
+        VALUES ($1,$2,$3,$4,$5,'incoming','PRIVATE PROMPT MUST NOT APPEAR')`,
+      [messageId, channel.organization_id, channel.id, conversationId, `message-${messageId}`]);
+      await f.pg.query(`INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body, state)
+        VALUES ($1,$2,$3,$4,$5,1,'PRIVATE REPLY MUST NOT APPEAR','sent')`,
+      [jobId, channel.organization_id, channel.id, conversationId, messageId]);
+      await f.pg.query(`INSERT INTO ai_usage(reply_job_id, organization_id, model, input_tokens, output_tokens, created_at)
+        VALUES ($1,$2,'fake-model',$3,$4,$5)`,
+      [jobId, channel.organization_id, inputTokens, outputTokens, createdAt.toISOString()]);
+    };
+    await recordUsage('usage-a', monthStart, 11, 3);
+    await recordUsage('usage-a', now, 7, 5);
+    await recordUsage('usage-a', previousMonth, 900, 900);
+    await recordUsage('usage-b', now, 4, 9);
+
+    f.resetQueryCount();
+    const unauthorized = await f.app.inject('/admin/api/ai-usage');
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(f.queryCount(), 0, 'unauthenticated usage request must not query data');
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test', origin: 'https://admin.test' };
+    const report = await f.app.inject({ method: 'GET', url: '/admin/api/ai-usage', headers });
+    assert.equal(report.statusCode, 200);
+    assert.deepEqual(report.json(), {
+      monthUtc: monthStart.toISOString().slice(0, 7),
+      companies: [
+        { company: 'Empresa A', calls: 2, inputTokens: '18', outputTokens: '8' },
+        { company: 'Empresa B', calls: 1, inputTokens: '4', outputTokens: '9' },
+        { company: 'Sem uso', calls: 0, inputTokens: '0', outputTokens: '0' },
+      ],
+    });
+    assert.equal(report.body.includes('PRIVATE PROMPT'), false);
+    assert.equal(report.body.includes('PRIVATE REPLY'), false);
+    assert.equal(report.body.includes('usage-a'), false);
+  } finally { await f.close(); }
 });
 
 test('conversation history requires admin auth and isolates same chat across companies and channels', async () => {
