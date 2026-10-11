@@ -1,11 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { Database } from './db.js';
+import type { Connection, Database } from './db.js';
 import { parseCompanyAIConfig, type CompanyAIConfig } from './ai-config.js';
 import { setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
-import { listCompanies, configureCompanyAI, createCompany, parseCompanyOnboarding } from './company-admin.js';
+import { listCompanies, configureCompanyAI, insertCompany, parseCompanyOnboarding } from './company-admin.js';
 import type { WahaAdminClient } from './waha-admin.js';
 import type { Store } from './store.js';
 
@@ -282,8 +282,8 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
       return reply.code(503).send({ error: 'send_uncertain', paused: true });
     }
   });
-  const channelForConnection = async (instance: string, session: string) => {
-    const result = await db.query<{ id: string }>(
+  const channelForConnection = async (connection: Pick<Connection, 'query'>, instance: string, session: string) => {
+    const result = await connection.query<{ id: string }>(
       'SELECT id FROM channels WHERE instance = $1 AND session = $2', [instance, session]);
     return result.rows.length > 0;
   };
@@ -291,22 +291,46 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     headers(reply); if (!guard(request, reply)) return;
     if (!ensureMutation(request)) return reject(reply, 400);
     const parsed = z.object({ company: z.string().trim().min(1).max(200),
-      instance: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/), session: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/) })
+      instance: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/), session: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/),
+      businessInfo: z.string().max(10_000).default(''), tone: z.string().max(300).default(''),
+      instructions: z.string().max(2_000).default('') })
       .strict().safeParse(request.body);
     if (!parsed.success) return reject(reply, 400);
     if (!connections.waha || !connections.publicBaseUrl) return reject(reply, 503);
-    const { company, instance, session } = parsed.data;
+    const { company, instance, session, businessInfo, tone, instructions } = parsed.data;
     const webhookToken = randomBytes(32).toString('hex');
+    let onboarding: ReturnType<typeof parseCompanyOnboarding>;
     try {
-      if (await channelForConnection(instance, session)) return reject(reply, 409);
-      const existing = await connections.waha.listSessions();
-      if (existing.some(item => item.name === session)) return reject(reply, 409);
-      const webhookUrl = new URL(`/webhooks/waha/${instance}`, connections.publicBaseUrl).toString();
-      await connections.waha.createStoppedSession(session, webhookUrl, webhookToken);
-      await createCompany(db, parseCompanyOnboarding(JSON.stringify({ name: company, instance, session, webhookToken })));
+      onboarding = parseCompanyOnboarding(JSON.stringify({ name: company, instance, session, webhookToken,
+        ai: { enabled: false, businessData: businessInfo.trim() ? { description: businessInfo } : {}, tone, instructions } }));
+    } catch { return reject(reply, 400); }
+    const duplicate = () => reply.code(409).send({ error: 'channel_already_registered' });
+    try {
+      // Keep the unique WAHA session claim in the transaction until its channel mapping commits.
+      const created = await db.transaction(async tx => {
+        const claim = await tx.query<{ session: string }>(
+          `INSERT INTO channel_onboarding_claims(instance, session) VALUES ($1, $2)
+           ON CONFLICT (session) DO NOTHING RETURNING session`, [instance, session]);
+        if (!claim.rows.length) return false;
+        try {
+          if (await channelForConnection(tx, instance, session)) return false;
+          const existing = await connections.waha!.listSessions();
+          if (existing.some(item => item.name === session)) return false;
+          const webhookUrl = new URL(`/webhooks/waha/${instance}`, connections.publicBaseUrl).toString();
+          await connections.waha!.createStoppedSession(session, webhookUrl, webhookToken);
+          await insertCompany(tx, onboarding);
+          return true;
+        } finally {
+          await tx.query('DELETE FROM channel_onboarding_claims WHERE session = $1', [session]);
+        }
+      });
+      if (!created) return duplicate();
       await connections.waha.startSession(session);
       return reply.code(201).send({ ok: true });
-    } catch { return reject(reply, 503); }
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === '23505') return duplicate();
+      return reject(reply, 503);
+    }
   });
   app.get('/admin/api/channel', async (request, reply) => {
     headers(reply); if (!guard(request, reply)) return;
@@ -330,7 +354,7 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     const mapping = mappingSchema.safeParse(request.query);
     if (!mapping.success || !connections.waha) return reject(reply, mapping.success ? 503 : 400);
     try {
-      if (!await channelForConnection(mapping.data.instance, mapping.data.session)) return reject(reply, 404);
+      if (!await channelForConnection(db, mapping.data.instance, mapping.data.session)) return reject(reply, 404);
       return await connections.waha.sessionStatus(mapping.data.session);
     } catch { return reject(reply, 503); }
   });
@@ -340,7 +364,7 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     const mapping = mappingSchema.safeParse(request.body);
     if (!mapping.success || !connections.waha) return reject(reply, mapping.success ? 503 : 400);
     try {
-      if (!await channelForConnection(mapping.data.instance, mapping.data.session)) return reject(reply, 404);
+      if (!await channelForConnection(db, mapping.data.instance, mapping.data.session)) return reject(reply, 404);
       await connections.waha.startSession(mapping.data.session);
       return { ok: true };
     } catch { return reject(reply, 503); }
@@ -350,7 +374,7 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     const mapping = mappingSchema.safeParse(request.query);
     if (!mapping.success || !connections.waha) return reject(reply, mapping.success ? 503 : 400);
     try {
-      if (!await channelForConnection(mapping.data.instance, mapping.data.session)) return reject(reply, 404);
+      if (!await channelForConnection(db, mapping.data.instance, mapping.data.session)) return reject(reply, 404);
       const status = await connections.waha.sessionStatus(mapping.data.session);
       if (status.status !== 'SCAN_QR_CODE') return reject(reply, 409);
       return reply.type('image/png').send(Buffer.from(await connections.waha.qrPng(mapping.data.session)));

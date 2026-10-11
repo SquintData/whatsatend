@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
-import { createDatabase, type Database } from './db.js';
+import { createDatabase, type Connection, type Database } from './db.js';
 import { parseCompanyAIConfig, type CompanyAIConfig } from './ai-config.js';
 import { setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
@@ -35,19 +35,21 @@ export function parseCompanyOnboarding(input: string): CompanyOnboarding {
 }
 
 export async function createCompany(db: Database, config: CompanyOnboarding): Promise<void> {
-  await db.transaction(async tx => {
-    const organizationId = randomUUID();
-    await tx.query(
-      `INSERT INTO organizations(id, name, ai_enabled, ai_model, ai_business_data, ai_tone, ai_instructions)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [organizationId, config.name, config.ai.enabled, config.ai.model, JSON.stringify(config.ai.businessData), config.ai.tone, config.ai.instructions],
-    );
-    await tx.query(
-      `INSERT INTO channels(id, organization_id, instance, session, token_hash, automation_scope)
-       VALUES ($1,$2,$3,$4,$5,'disabled')`,
-      [randomUUID(), organizationId, config.instance, config.session, tokenHash(config.webhookToken)],
-    );
-  });
+  await db.transaction(tx => insertCompany(tx, config));
+}
+
+export async function insertCompany(tx: Connection, config: CompanyOnboarding): Promise<void> {
+  const organizationId = randomUUID();
+  await tx.query(
+    `INSERT INTO organizations(id, name, ai_enabled, ai_model, ai_business_data, ai_tone, ai_instructions)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [organizationId, config.name, config.ai.enabled, config.ai.model, JSON.stringify(config.ai.businessData), config.ai.tone, config.ai.instructions],
+  );
+  await tx.query(
+    `INSERT INTO channels(id, organization_id, instance, session, token_hash, automation_scope)
+     VALUES ($1,$2,$3,$4,$5,'disabled')`,
+    [randomUUID(), organizationId, config.instance, config.session, tokenHash(config.webhookToken)],
+  );
 }
 
 export async function configureCompanyAI(

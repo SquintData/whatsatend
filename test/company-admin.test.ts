@@ -11,7 +11,7 @@ import { tokenHash } from '../src/store.js';
 
 async function fixture() {
   const pg = new PGlite();
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
