@@ -87,7 +87,7 @@ test('conversation detail discards a prior channel response after the selected c
   assert.ok(mountStart >= 0 && mountEnd > mountStart);
   const mount = adminPage.slice(mountStart, mountEnd);
   const detailFetch = mount.indexOf("await api('/admin/api/conversation?");
-  const detailCheck = mount.indexOf('detailGuard.isCurrent(detailRequest)');
+  const detailCheck = mount.indexOf('detailGuard.isCurrent(request)', detailFetch);
   assert.ok(detailCheck > detailFetch, 'detail rendering must verify the current channel/conversation request after fetch');
   const start = adminPage.indexOf('function createConversationSearchGuard');
   const end = adminPage.indexOf('\nfunction mountConversationHistory', start);

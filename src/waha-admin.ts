@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { directChat, SendError, type Sender } from './automation.js';
 
 export interface WahaAdminSettings { baseUrl: string; apiKey: string }
 export interface WahaSessionStatus { status: string; engine: string | null; account: string | null }
@@ -6,7 +7,7 @@ export interface WahaSessionStatus { status: string; engine: string | null; acco
 const sessionName = z.string().min(1).max(200);
 const apiFailure = () => new Error('WAHA request failed; details omitted');
 
-export class WahaAdminClient {
+export class WahaAdminClient implements Sender {
   private readonly baseUrl: string;
   constructor(settings: WahaAdminSettings, private readonly transport: typeof fetch = fetch) {
     const parsed = z.string().url().safeParse(settings.baseUrl);
@@ -35,6 +36,24 @@ export class WahaAdminClient {
   // Keep the key in a private closure-like field and never include it in errors.
   private apiKeyValue = '';
   private apiKey(): string { return this.apiKeyValue; }
+
+  async send(request: { session: string; chatId: string; text: string }): Promise<{ id: string }> {
+    if (!sessionName.safeParse(request.session).success || !directChat(request.chatId)
+      || !request.text.trim() || request.text.length > 16_000) throw new SendError('failed');
+    try {
+      const response = await this.transport(`${this.baseUrl}/api/sendText`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Api-Key': this.apiKey() },
+        body: JSON.stringify(request), redirect: 'error', signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) throw new SendError('uncertain');
+      const parsed = z.object({ id: z.string().min(1).max(512) }).safeParse(await response.json());
+      if (!parsed.success) throw new SendError('uncertain');
+      return parsed.data;
+    } catch (error) {
+      if (error instanceof SendError) throw error;
+      throw new SendError('uncertain');
+    }
+  }
 
   async listSessions(): Promise<Array<{ name: string; status: string }>> {
     const body: unknown = await (await this.request('/api/sessions?all=true')).json();

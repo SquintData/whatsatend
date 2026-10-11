@@ -22,6 +22,8 @@ function frontendApi(fetcher: (url: string, options: { method?: string; headers:
 async function fixture(withAdmin = true) {
   const pg = new PGlite();
   let queryCount = 0;
+  let beforeManualSend: (() => Promise<void>) | undefined;
+  let manualSendStatus = 200;
   const wahaCalls: Array<{ url: string; init: RequestInit }> = [];
   for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
@@ -35,6 +37,10 @@ async function fixture(withAdmin = true) {
   const waha = new WahaAdminClient({ baseUrl: 'http://waha.local', apiKey: 'test-key-'.padEnd(40, 'x') }, async (input, init = {}) => {
     const url = String(input);
     wahaCalls.push({ url, init });
+    if (url.endsWith('/api/sendText')) {
+      await beforeManualSend?.();
+      return manualSendStatus === 200 ? Response.json({ id: 'manual-out-1' }) : new Response(null, { status: manualSendStatus });
+    }
     if (url.endsWith('/api/sessions?all=true')) return Response.json([]);
     if (url.endsWith('/api/sessions')) return Response.json({ name: 'created', status: 'STOPPED' });
     if (url.endsWith('/start')) return new Response(null, { status: 200 });
@@ -45,6 +51,8 @@ async function fixture(withAdmin = true) {
   const app = buildApp(new Store(db), false, withAdmin ? { db, secret: 'admin-secret-'.padEnd(40, 'x'), waha,
     publicBaseUrl: 'https://app.local' } : undefined);
   return { pg, db, app, wahaCalls, queryCount: () => queryCount, resetQueryCount: () => { queryCount = 0; },
+    setBeforeManualSend: (handler: () => Promise<void>) => { beforeManualSend = handler; },
+    setManualSendStatus: (status: number) => { manualSendStatus = status; },
     close: async () => { await app.close(); await pg.close(); } };
 }
 
@@ -134,6 +142,108 @@ test('admin panel requires secret login, hides channel tokens, and updates only 
   } finally { await f.close(); }
 });
 
+test('manual reply authenticates, isolates channel, pauses before WAHA and records only confirmed outgoing messages', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa A', instance: 'principal', session: 'a', webhookToken: 'a'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa B', instance: 'principal', session: 'b', webhookToken: 'b'.repeat(64) })));
+    const channels = await f.pg.query<{ id: string; organization_id: string; session: string }>(
+      'SELECT id, organization_id, session FROM channels ORDER BY session');
+    const conversationA = randomUUID();
+    const conversationB = randomUUID();
+    const jobId = randomUUID();
+    const messageId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode,automation_epoch)
+      VALUES ($1,$2,$3,'5511999999999@c.us','auto',7),($4,$5,$6,'5511999999999@c.us','human',3)`,
+      [conversationA, channels.rows[0]!.organization_id, channels.rows[0]!.id,
+        conversationB, channels.rows[1]!.organization_id, channels.rows[1]!.id]);
+    await f.pg.query(`INSERT INTO messages(id,organization_id,channel_id,conversation_id,provider_message_id,direction,body)
+      VALUES ($1,$2,$3,$4,'incoming-a','incoming','Need help')`,
+      [messageId, channels.rows[0]!.organization_id, channels.rows[0]!.id, conversationA]);
+    await f.pg.query(`INSERT INTO reply_jobs(id,organization_id,channel_id,conversation_id,source_message_id,epoch,body)
+      VALUES ($1,$2,$3,$4,$5,7,'automatic reply')`,
+      [jobId, channels.rows[0]!.organization_id, channels.rows[0]!.id, conversationA, messageId]);
+
+    f.resetQueryCount();
+    const unauthorized = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply',
+      headers: { host: 'admin.test', origin: 'https://admin.test', 'x-admin-action': '1' },
+      payload: { instance: 'principal', session: 'a', id: conversationA, text: 'Manual reply' } });
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(f.queryCount(), 0);
+    assert.equal(f.wahaCalls.length, 0);
+
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+
+    const crossChannel = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers,
+      payload: { instance: 'principal', session: 'b', id: conversationA, text: 'Should not send' } });
+    assert.equal(crossChannel.statusCode, 404);
+    assert.equal(f.wahaCalls.length, 0, 'cross-channel ID must not reach WAHA');
+
+    const paused = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/pause', headers,
+      payload: { instance: 'principal', session: 'a', id: conversationA } });
+    assert.equal(paused.statusCode, 200);
+
+    f.setBeforeManualSend(async () => {
+      const state = await f.pg.query<{ mode: string; automation_epoch: number; state: string }>(
+        `SELECT cv.mode, cv.automation_epoch, j.state FROM conversations cv JOIN reply_jobs j ON j.conversation_id=cv.id WHERE cv.id=$1`, [conversationA]);
+      assert.deepEqual(state.rows[0], { mode: 'human', automation_epoch: 9, state: 'cancelled' },
+        'the committed pause and cancellation must happen before WAHA');
+    });
+    const sent = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers,
+      payload: { instance: 'principal', session: 'a', id: conversationA, text: 'Manual reply' } });
+    assert.equal(sent.statusCode, 200);
+    const sendCalls = f.wahaCalls.filter(call => call.url.endsWith('/api/sendText'));
+    assert.equal(sendCalls.length, 1);
+    assert.deepEqual(JSON.parse(String(sendCalls[0]!.init.body)), {
+      session: 'a', chatId: '5511999999999@c.us', text: 'Manual reply',
+    });
+    assert.equal((sendCalls[0]!.init.headers as Record<string, string>)['X-Api-Key'], 'test-key-'.padEnd(40, 'x'));
+    assert.equal(sent.body.includes('test-key-'), false, 'WAHA key must stay out of API responses');
+    const echo = await f.app.inject({ method: 'POST', url: '/webhooks/waha/principal', headers: { 'x-webhook-token': 'a'.repeat(64) },
+      payload: { event: 'message.any', session: 'a', payload: { id: 'manual-out-1', from: 'our-account@c.us',
+        to: '5511999999999@c.us', fromMe: true, body: 'Manual reply' } } });
+    assert.equal(echo.statusCode, 200);
+    assert.equal(echo.json().status, 'duplicate', 'the later WAHA echo must deduplicate the already recorded send');
+    const stored = await f.pg.query<{ mode: string; direction: string; body: string; provider_message_id: string }>(
+      `SELECT cv.mode,m.direction,m.body,m.provider_message_id FROM conversations cv JOIN messages m ON m.conversation_id=cv.id
+       WHERE cv.id=$1 AND m.provider_message_id='manual-out-1'`, [conversationA]);
+    assert.deepEqual(stored.rows[0], { mode: 'human', direction: 'outgoing', body: 'Manual reply', provider_message_id: 'manual-out-1' });
+    const other = await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE id=$1', [conversationB]);
+    assert.equal(other.rows[0]!.mode, 'human');
+  } finally { await f.close(); }
+});
+
+test('manual send uncertainty leaves the conversation paused and does not create a retryable outgoing message', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa', instance: 'principal', session: 'a', webhookToken: 'a'.repeat(64) })));
+    const channel = (await f.pg.query<{ id: string; organization_id: string }>('SELECT id, organization_id FROM channels')).rows[0]!;
+    const conversationId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode,automation_epoch)
+      VALUES ($1,$2,$3,'5511999999999@c.us','auto',4)`, [conversationId, channel.organization_id, channel.id]);
+    f.setManualSendStatus(504);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+    const response = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers,
+      payload: { instance: 'principal', session: 'a', id: conversationId, text: 'Possibly sent' } });
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.json(), { error: 'send_uncertain', paused: true });
+    const stored = await f.pg.query<{ mode: string; automation_epoch: number; outgoing: number }>(
+      `SELECT cv.mode,cv.automation_epoch,(SELECT count(*)::int FROM messages m WHERE m.conversation_id=cv.id AND m.direction='outgoing') AS outgoing
+       FROM conversations cv WHERE cv.id=$1`, [conversationId]);
+    assert.deepEqual(stored.rows[0], { mode: 'human', automation_epoch: 6, outgoing: 0 });
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sendText')).length, 1,
+      'an uncertain WAHA result is not automatically retried');
+  } finally { await f.close(); }
+});
+
 test('admin panel script remains valid and includes channel connection operations', () => {
   const start = adminPage.indexOf('<script>') + '<script>'.length;
   const end = adminPage.indexOf('</script>', start);
@@ -145,6 +255,9 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /Conversas e histórico/);
   assert.match(adminPage, /Abrir histórico/);
   assert.match(adminPage, /admin\/api\/conversations/);
+  assert.match(adminPage, /admin\/api\/conversation\/pause/);
+  assert.match(adminPage, /admin\/api\/conversation\/reply/);
+  assert.match(adminPage, /Enviar resposta manual/);
 });
 
 test('conversation history requires admin auth and isolates same chat across companies and channels', async () => {

@@ -12,6 +12,10 @@ export interface Reaction {
   id: string; timestamp: number; fromMe: boolean; source?: string;
   reaction: { text: string; messageId: string };
 }
+export interface ManualConversationTarget {
+  organizationId: string; channelId: string; conversationId: string; session: string; chatId: string;
+  channelActive: boolean; organizationActive: boolean;
+}
 
 export class Store {
   constructor(private db: Database, private automation: Automation = disabledAutomation, private aiProvider?: AIProvider) {}
@@ -108,6 +112,56 @@ export class Store {
         );
       }
       return inserted.rows.length > 0;
+    });
+  }
+
+  async pauseConversation(instance: string, session: string, conversationId: string): Promise<ManualConversationTarget | undefined> {
+    return this.db.transaction(async tx => {
+      const channel = await tx.query<{
+        id: string; organization_id: string; session: string; active: boolean; organization_active: boolean;
+      }>(`SELECT ch.id, ch.organization_id, ch.session, ch.active, o.active AS organization_active
+        FROM channels ch JOIN organizations o ON o.id = ch.organization_id
+        WHERE ch.instance = $1 AND ch.session = $2 FOR UPDATE OF ch, o`, [instance, session]);
+      const scopedChannel = channel.rows[0];
+      if (!scopedChannel) return undefined;
+      const conversation = await tx.query<{ id: string; chat_id: string }>(
+        `SELECT id, chat_id FROM conversations WHERE id = $1 AND organization_id = $2 AND channel_id = $3 FOR UPDATE`,
+        [conversationId, scopedChannel.organization_id, scopedChannel.id]);
+      const row = conversation.rows[0];
+      if (!row || !directChat(row.chat_id)) return undefined;
+      await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
+        [conversationId, scopedChannel.organization_id, scopedChannel.id]);
+      await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
+        WHERE organization_id = $1 AND channel_id = $2 AND conversation_id = $3 AND state = 'pending'`,
+        [scopedChannel.organization_id, scopedChannel.id, conversationId]);
+      return { organizationId: scopedChannel.organization_id, channelId: scopedChannel.id,
+        conversationId, session: scopedChannel.session, chatId: row.chat_id,
+        channelActive: scopedChannel.active, organizationActive: scopedChannel.organization_active };
+    });
+  }
+
+  async recordManualOutgoing(target: ManualConversationTarget, body: string, providerMessageId: string): Promise<void> {
+    await this.db.transaction(async tx => {
+      await tx.query('SELECT id FROM channels WHERE id = $1 AND organization_id = $2 FOR UPDATE',
+        [target.channelId, target.organizationId]);
+      const conversation = await tx.query<{ id: string; chat_id: string }>(
+        `SELECT id, chat_id FROM conversations WHERE id = $1 AND organization_id = $2 AND channel_id = $3 FOR UPDATE`,
+        [target.conversationId, target.organizationId, target.channelId]);
+      if (conversation.rows[0]?.chat_id !== target.chatId) throw new Error('Conversation changed during manual send');
+      await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
+        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
+        [target.conversationId, target.organizationId, target.channelId]);
+      await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
+        WHERE organization_id = $1 AND channel_id = $2 AND conversation_id = $3 AND state = 'pending'`,
+        [target.organizationId, target.channelId, target.conversationId]);
+      await tx.query(`INSERT INTO messages(id, organization_id, channel_id, conversation_id,
+        provider_message_id, direction, body, provider_timestamp)
+        VALUES ($1,$2,$3,$4,$5,'outgoing',$6,floor(extract(epoch FROM now()))::bigint)
+        ON CONFLICT (channel_id, provider_message_id) DO NOTHING`,
+        [randomUUID(), target.organizationId, target.channelId, target.conversationId, providerMessageId, body]);
     });
   }
 
