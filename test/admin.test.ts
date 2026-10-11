@@ -312,6 +312,9 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /Consumo de IA/);
   assert.match(adminPage, /\/admin\/api\/ai-usage/);
   assert.match(adminPage, /Tokens de entrada/);
+  assert.match(adminPage, /Fila de aten/);
+  assert.match(adminPage, /admin\/api\/attention/);
+  assert.match(adminPage, /Sem itens que precisem de aten/);
   assert.match(adminPage, /Tokens de sa[ií]da/);
 });
 
@@ -370,6 +373,75 @@ test('AI usage is admin-only, isolated by company, includes zero-use companies a
     assert.equal(report.body.includes('PRIVATE PROMPT'), false);
     assert.equal(report.body.includes('PRIVATE REPLY'), false);
     assert.equal(report.body.includes('usage-a'), false);
+  } finally { await f.close(); }
+});
+
+test('attention queue is admin-only, tenant-labeled, recent, bounded and excludes job/message contents', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Aten\u00e7\u00e3o A', instance: 'principal', session: 'attention-a', webhookToken: 'a'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Aten\u00e7\u00e3o B', instance: 'principal', session: 'attention-b', webhookToken: 'b'.repeat(64) })));
+    const channels = (await f.pg.query<{ id: string; organization_id: string; instance: string; session: string }>(
+      'SELECT id, organization_id, instance, session FROM channels ORDER BY session')).rows;
+    const bySession = new Map(channels.map(channel => [channel.session, channel]));
+
+    f.resetQueryCount();
+    const unauthorized = await f.app.inject('/admin/api/attention');
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(f.queryCount(), 0, 'unauthenticated attention request must not query data');
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test', origin: 'https://admin.test' };
+    const empty = await f.app.inject({ method: 'GET', url: '/admin/api/attention', headers });
+    assert.equal(empty.statusCode, 200);
+    assert.deepEqual(empty.json(), { items: [] });
+
+    const records = Array.from({ length: 54 }, (_, index) => {
+      const channel = bySession.get(index % 2 === 0 ? 'attention-a' : 'attention-b')!;
+      const occurredAt = new Date(Date.UTC(2025, 0, 1) + index * 60_000).toISOString();
+      return { index, channel, conversationId: randomUUID(), messageId: randomUUID(), jobId: randomUUID(),
+        chatId: `attention-${index}@c.us`, occurredAt,
+        state: index === 53 ? 'sent' : index % 2 === 0 ? 'failed' : 'uncertain' };
+    });
+    const insertBatch = async (table: string, columns: string[], rows: unknown[][]) => {
+      const values: unknown[] = [];
+      const tuples = rows.map(row => `(${row.map(value => { values.push(value); return `$${values.length}`; }).join(',')})`);
+      await f.pg.query(`INSERT INTO ${table}(${columns.join(',')}) VALUES ${tuples.join(',')}`, values);
+    };
+    await insertBatch('conversations', ['id', 'organization_id', 'channel_id', 'chat_id', 'created_at'], records.map(record => [
+      record.conversationId, record.channel.organization_id, record.channel.id, record.chatId, record.occurredAt,
+    ]));
+    await insertBatch('messages', ['id', 'organization_id', 'channel_id', 'conversation_id', 'provider_message_id', 'direction', 'body', 'received_at'], records.map(record => [
+      record.messageId, record.channel.organization_id, record.channel.id, record.conversationId,
+      `source-${record.index}`, 'incoming', 'PRIVATE PROMPT <img src=x onerror=alert(1)>', record.occurredAt,
+    ]));
+    await insertBatch('reply_jobs', ['id', 'organization_id', 'channel_id', 'conversation_id', 'source_message_id', 'epoch', 'body', 'state', 'created_at', 'completed_at'], records.map(record => [
+      record.jobId, record.channel.organization_id, record.channel.id, record.conversationId, record.messageId,
+      1, 'PRIVATE GENERATED REPLY', record.state, record.occurredAt, record.occurredAt,
+    ]));
+
+    const response = await f.app.inject({ method: 'GET', url: '/admin/api/attention?limit=500', headers });
+    assert.equal(response.statusCode, 200);
+    const report = response.json();
+    assert.equal(report.items.length, 50, 'endpoint enforces a fixed maximum independent of query parameters');
+    assert.equal(report.items[0].conversationId, records[52]!.conversationId, 'newest failed/uncertain job is first');
+    assert.equal(report.items[49].conversationId, records[3]!.conversationId, 'older jobs fall off the 50-item window');
+    assert.ok(report.items.some((item: { status: string }) => item.status === 'failed'));
+    assert.ok(report.items.some((item: { status: string }) => item.status === 'uncertain'));
+    for (const item of report.items as Array<{ organization: string; instance: string; session: string; conversationId: string; status: string; attentionAt: string }>) {
+      const source = records.find(record => record.conversationId === item.conversationId)!;
+      assert.equal(item.organization, source.channel.session === 'attention-a' ? 'Aten\u00e7\u00e3o A' : 'Aten\u00e7\u00e3o B');
+      assert.equal(item.instance, source.channel.instance);
+      assert.equal(item.session, source.channel.session);
+      assert.equal(item.status, source.state);
+      assert.equal(item.attentionAt, source.occurredAt);
+    }
+    assert.equal(response.body.includes('PRIVATE PROMPT'), false);
+    assert.equal(response.body.includes('PRIVATE GENERATED REPLY'), false);
+    assert.equal(response.body.includes('token_hash'), false);
+    assert.equal(report.items.some((item: { conversationId: string }) => item.conversationId === records[53]!.conversationId), false,
+      'sent jobs are not part of the attention queue');
   } finally { await f.close(); }
 });
 

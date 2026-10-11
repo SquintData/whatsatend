@@ -112,3 +112,63 @@ test('conversation detail discards a prior channel response after the selected c
   await renderA;
   assert.deepEqual(rendered, ['detail-from-b']);
 });
+
+test('attention queue renders untrusted tenant/channel values as text and links to the existing conversation detail', () => {
+  const start = adminPage.indexOf('function renderReplyAttentionItems');
+  const end = adminPage.indexOf('\nfunction mountConversationHistory', start);
+  assert.ok(start >= 0 && end > start, 'admin UI must expose the attention row renderer');
+  const create = runInNewContext(`(()=>{${adminPage.slice(start, end)};return renderReplyAttentionItems})()`) as
+    (items: Array<Record<string, unknown>>, target: FakeElement, open: (item: unknown) => void, documentRef: FakeDocument) => void;
+  const documentRef = fakeDocument();
+  const target = documentRef.createElement('div');
+  const opened: unknown[] = [];
+  const malicious = '<img src=x onerror=alert(1)>';
+  const item = { organization: malicious, instance: 'instance-a', session: malicious, conversationId: 'conversation-a',
+    status: 'uncertain', attentionAt: '2026-10-11T12:00:00.000Z' };
+  create([item], target, value => opened.push(value), documentRef);
+  const nodes = flatten(target);
+  assert.ok(nodes.some(node => node.textContent === malicious), 'untrusted names are kept as literal text');
+  assert.equal(nodes.some(node => node.tagName === 'img'), false);
+  const link = nodes.find(node => node.tagName === 'a');
+  assert.ok(link);
+  assert.equal(link.href, '#conversation-detail');
+  link.onclick?.({ preventDefault() {} });
+  assert.deepEqual(opened, [item]);
+
+  const empty = documentRef.createElement('div');
+  create([], empty, () => {}, documentRef);
+  assert.match(empty.textContent, /Sem itens que precisem de aten/);
+});
+
+interface FakeElement {
+  tagName: string;
+  textContent: string;
+  href: string;
+  children: FakeElement[];
+  onclick?: (event: { preventDefault(): void }) => void;
+  append(...nodes: FakeElement[]): void;
+  replaceChildren(...nodes: FakeElement[]): void;
+  innerHTML: string;
+}
+
+interface FakeDocument { createElement(tag: string): FakeElement }
+
+function fakeDocument(): FakeDocument {
+  return { createElement(tag) {
+    const element: FakeElement = {
+      tagName: tag,
+      textContent: '',
+      href: '',
+      children: [],
+      append(...nodes) { this.children.push(...nodes); },
+      replaceChildren(...nodes) { this.children = [...nodes]; this.textContent = ''; },
+      get innerHTML() { return ''; },
+      set innerHTML(_value: string) { throw new Error('innerHTML must not be used for attention data'); },
+    };
+    return element;
+  } };
+}
+
+function flatten(root: FakeElement): FakeElement[] {
+  return [root, ...root.children.flatMap(flatten)];
+}
