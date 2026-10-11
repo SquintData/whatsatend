@@ -288,6 +288,11 @@ test('admin panel script remains valid and includes channel connection operation
   assert.ok(start >= '<script>'.length && end > start);
   assert.doesNotThrow(() => new Function(adminPage.slice(start, end)));
   assert.match(adminPage, /Cadastrar empresa e canal/);
+  assert.match(adminPage, /name="businessInfo"[^>]*maxlength="10000"/);
+  assert.match(adminPage, /name="tone"[^>]*maxlength="300"/);
+  assert.match(adminPage, /name="instructions"[^>]*maxlength="2000"/);
+  assert.match(adminPage, /Informações da empresa para a IA/);
+  assert.match(adminPage, /Sessão já cadastrada neste canal ou existente no WAHA/);
   assert.match(adminPage, /Conexão/);
   assert.match(adminPage, /Exibir QR de pareamento/);
   assert.match(adminPage, /Conversas e histórico/);
@@ -473,8 +478,11 @@ test('admin provisions an isolated disabled channel with a backend-only webhook 
       payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
     const cookie = String(login.headers['set-cookie']).split(';')[0]!;
     const headers = { ...originHeaders, cookie, 'x-admin-action': '1' };
+    const businessInfo = 'Clinica de fisioterapia; atendimento de segunda a sexta.';
+    const tone = 't'.repeat(300);
+    const instructions = 'i'.repeat(2_000);
     const created = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
-      payload: { company: 'Empresa QR', instance: 'instance-qr', session: 'qr-channel' } });
+      payload: { company: 'Empresa QR', instance: 'instance-qr', session: 'qr-channel', businessInfo, tone, instructions } });
     assert.equal(created.statusCode, 201);
     assert.equal(created.body.includes('X-Webhook-Token'), false);
     const webhookConfig = JSON.parse(String(f.wahaCalls[1]!.init.body)).config.webhooks[0];
@@ -489,6 +497,31 @@ test('admin provisions an isolated disabled channel with a backend-only webhook 
     assert.equal(stored.rows[0]!.token_hash, tokenHash(generatedToken));
     assert.equal(stored.rows[0]!.token_hash.includes(generatedToken), false);
     assert.equal(stored.rows[0]!.automation_scope, 'disabled');
+    const ai = await f.pg.query<{ ai_enabled: boolean; ai_model: string; ai_business_data: Record<string, string>;
+      ai_tone: string; ai_instructions: string }>(
+      `SELECT o.ai_enabled, o.ai_model, o.ai_business_data, o.ai_tone, o.ai_instructions
+       FROM organizations o JOIN channels c ON c.organization_id = o.id WHERE c.session = $1`, ['qr-channel']);
+    assert.deepEqual(ai.rows[0], { ai_enabled: false, ai_model: 'gpt-4o-mini',
+      ai_business_data: { description: businessInfo }, ai_tone: tone, ai_instructions: instructions });
+
+    const duplicate = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+      payload: { company: 'Nao reassociar', instance: 'instance-qr', session: 'qr-channel', businessInfo: 'other' } });
+    assert.equal(duplicate.statusCode, 409);
+    assert.deepEqual(duplicate.json(), { error: 'channel_already_registered' });
+    assert.equal(f.wahaCalls.length, 3, 'duplicate mapping must be rejected before touching WAHA');
+    assert.equal((await f.pg.query('SELECT id FROM organizations')).rows.length, 1);
+
+    const invalidPayloads = [
+      { businessInfo: 'x'.repeat(9_990) }, { businessInfo: 'x'.repeat(10_001) },
+      { tone: 't'.repeat(301) }, { instructions: 'i'.repeat(2_001) },
+    ];
+    for (const [index, invalid] of invalidPayloads.entries()) {
+      const rejected = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+        payload: { company: 'Limite invalido', instance: 'instance-qr', session: `invalid-${index}`,
+          ...invalid } });
+      assert.equal(rejected.statusCode, 400);
+    }
+    assert.equal(f.wahaCalls.length, 3, 'invalid onboarding data must be rejected before touching WAHA');
 
     const status = await f.app.inject({ method: 'GET', url: '/admin/api/channel/status?instance=instance-qr&session=qr-channel', headers });
     assert.equal(status.statusCode, 200);
