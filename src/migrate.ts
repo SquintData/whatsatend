@@ -17,6 +17,9 @@ try {
     }
   });
   console.log('Database migrations ready');
-} catch {
-  console.error('Migration failed; check database access'); process.exitCode = 1;
+} catch (error) {
+  const duplicateSessionError = 'Cannot enforce global WAHA session uniqueness while duplicate channel sessions exist';
+  console.error(error instanceof Error && error.message.includes(duplicateSessionError)
+    ? duplicateSessionError : 'Migration failed; check database access');
+  process.exitCode = 1;
 } finally { await close(); }

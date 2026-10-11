@@ -23,9 +23,11 @@ async function fixture(withAdmin = true) {
   const pg = new PGlite();
   let queryCount = 0;
   let beforeManualSend: (() => Promise<void>) | undefined;
+  let beforeSessionCreate: (() => Promise<void>) | undefined;
   let manualSendStatus = 200;
+  const wahaSessions = new Set<string>();
   const wahaCalls: Array<{ url: string; init: RequestInit }> = [];
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -41,8 +43,13 @@ async function fixture(withAdmin = true) {
       await beforeManualSend?.();
       return manualSendStatus === 200 ? Response.json({ id: 'manual-out-1' }) : new Response(null, { status: manualSendStatus });
     }
-    if (url.endsWith('/api/sessions?all=true')) return Response.json([]);
-    if (url.endsWith('/api/sessions')) return Response.json({ name: 'created', status: 'STOPPED' });
+    if (url.endsWith('/api/sessions?all=true')) return Response.json([...wahaSessions].map(name => ({ name, status: 'STOPPED' })));
+    if (url.endsWith('/api/sessions')) {
+      await beforeSessionCreate?.();
+      const sessionName = JSON.parse(String(init.body)).name as string;
+      wahaSessions.add(sessionName);
+      return Response.json({ name: sessionName, status: 'STOPPED' });
+    }
     if (url.endsWith('/start')) return new Response(null, { status: 200 });
     if (url.endsWith('/auth/qr')) return new Response(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), { headers: { 'content-type': 'image/png' } });
     if (url.includes('/api/sessions/')) return Response.json({ status: url.includes('qr-channel') ? 'SCAN_QR_CODE' : 'WORKING', engine: 'GOWS', me: { id: '5511999999999@c.us' } });
@@ -52,6 +59,7 @@ async function fixture(withAdmin = true) {
     publicBaseUrl: 'https://app.local' } : undefined);
   return { pg, db, app, wahaCalls, queryCount: () => queryCount, resetQueryCount: () => { queryCount = 0; },
     setBeforeManualSend: (handler: () => Promise<void>) => { beforeManualSend = handler; },
+    setBeforeSessionCreate: (handler: () => Promise<void>) => { beforeSessionCreate = handler; },
     setManualSendStatus: (status: number) => { manualSendStatus = status; },
     close: async () => { await app.close(); await pg.close(); } };
 }
@@ -288,6 +296,11 @@ test('admin panel script remains valid and includes channel connection operation
   assert.ok(start >= '<script>'.length && end > start);
   assert.doesNotThrow(() => new Function(adminPage.slice(start, end)));
   assert.match(adminPage, /Cadastrar empresa e canal/);
+  assert.match(adminPage, /name="businessInfo"[^>]*maxlength="10000"/);
+  assert.match(adminPage, /name="tone"[^>]*maxlength="300"/);
+  assert.match(adminPage, /name="instructions"[^>]*maxlength="2000"/);
+  assert.match(adminPage, /Informações da empresa para a IA/);
+  assert.match(adminPage, /Sessão já cadastrada neste canal ou existente no WAHA/);
   assert.match(adminPage, /Conexão/);
   assert.match(adminPage, /Exibir QR de pareamento/);
   assert.match(adminPage, /Conversas e histórico/);
@@ -473,8 +486,11 @@ test('admin provisions an isolated disabled channel with a backend-only webhook 
       payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
     const cookie = String(login.headers['set-cookie']).split(';')[0]!;
     const headers = { ...originHeaders, cookie, 'x-admin-action': '1' };
+    const businessInfo = 'Clinica de fisioterapia; atendimento de segunda a sexta.';
+    const tone = 't'.repeat(300);
+    const instructions = 'i'.repeat(2_000);
     const created = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
-      payload: { company: 'Empresa QR', instance: 'instance-qr', session: 'qr-channel' } });
+      payload: { company: 'Empresa QR', instance: 'instance-qr', session: 'qr-channel', businessInfo, tone, instructions } });
     assert.equal(created.statusCode, 201);
     assert.equal(created.body.includes('X-Webhook-Token'), false);
     const webhookConfig = JSON.parse(String(f.wahaCalls[1]!.init.body)).config.webhooks[0];
@@ -489,6 +505,31 @@ test('admin provisions an isolated disabled channel with a backend-only webhook 
     assert.equal(stored.rows[0]!.token_hash, tokenHash(generatedToken));
     assert.equal(stored.rows[0]!.token_hash.includes(generatedToken), false);
     assert.equal(stored.rows[0]!.automation_scope, 'disabled');
+    const ai = await f.pg.query<{ ai_enabled: boolean; ai_model: string; ai_business_data: Record<string, string>;
+      ai_tone: string; ai_instructions: string }>(
+      `SELECT o.ai_enabled, o.ai_model, o.ai_business_data, o.ai_tone, o.ai_instructions
+       FROM organizations o JOIN channels c ON c.organization_id = o.id WHERE c.session = $1`, ['qr-channel']);
+    assert.deepEqual(ai.rows[0], { ai_enabled: false, ai_model: 'gpt-4o-mini',
+      ai_business_data: { description: businessInfo }, ai_tone: tone, ai_instructions: instructions });
+
+    const duplicate = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+      payload: { company: 'Nao reassociar', instance: 'instance-qr', session: 'qr-channel', businessInfo: 'other' } });
+    assert.equal(duplicate.statusCode, 409);
+    assert.deepEqual(duplicate.json(), { error: 'channel_already_registered' });
+    assert.equal(f.wahaCalls.length, 3, 'duplicate mapping must be rejected before touching WAHA');
+    assert.equal((await f.pg.query('SELECT id FROM organizations')).rows.length, 1);
+
+    const invalidPayloads = [
+      { businessInfo: 'x'.repeat(9_990) }, { businessInfo: 'x'.repeat(10_001) },
+      { tone: 't'.repeat(301) }, { instructions: 'i'.repeat(2_001) },
+    ];
+    for (const [index, invalid] of invalidPayloads.entries()) {
+      const rejected = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+        payload: { company: 'Limite invalido', instance: 'instance-qr', session: `invalid-${index}`,
+          ...invalid } });
+      assert.equal(rejected.statusCode, 400);
+    }
+    assert.equal(f.wahaCalls.length, 3, 'invalid onboarding data must be rejected before touching WAHA');
 
     const status = await f.app.inject({ method: 'GET', url: '/admin/api/channel/status?instance=instance-qr&session=qr-channel', headers });
     assert.equal(status.statusCode, 200);
@@ -502,5 +543,86 @@ test('admin provisions an isolated disabled channel with a backend-only webhook 
     } })).statusCode, 409, 'a channel cannot be enabled until WAHA reports WORKING and a linked account');
     const deniedQr = await f.app.inject('/admin/api/channel/qr?instance=instance-qr&session=qr-channel');
     assert.equal(deniedQr.statusCode, 401);
+  } finally { await f.close(); }
+});
+
+test('concurrent channel onboarding reserves the session before only one WAHA create', async () => {
+  const f = await fixture();
+  let releaseCreate!: () => void;
+  try {
+    const originHeaders = { host: 'admin.test', origin: 'https://admin.test' };
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: originHeaders,
+      payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { ...originHeaders, cookie: String(login.headers['set-cookie']).split(';')[0]!, 'x-admin-action': '1' };
+    let createEntered!: () => void;
+    const entered = new Promise<void>(resolve => { createEntered = resolve; });
+    const createBarrier = new Promise<void>(resolve => { releaseCreate = resolve; });
+    f.setBeforeSessionCreate(async () => { createEntered(); await createBarrier; });
+    const payload = { company: 'Empresa Concorrente', instance: 'principal', session: 'same-session' };
+    const first = f.app.inject({ method: 'POST', url: '/admin/api/channels', headers, payload });
+    await entered;
+
+    const second = f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+      payload: { ...payload, company: 'Outra empresa', instance: 'other-instance' } });
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sessions')).length, 1,
+      'the second request must remain behind the database reservation while WAHA create is blocked');
+
+    releaseCreate();
+    const responses = await Promise.all([first, second]);
+    assert.deepEqual(responses.map(response => response.statusCode).sort(), [201, 409]);
+    assert.equal(responses.find(response => response.statusCode === 409)?.json().error, 'channel_already_registered');
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sessions')).length, 1);
+    assert.equal((await f.pg.query('SELECT id FROM organizations')).rows.length, 1);
+    assert.equal((await f.pg.query('SELECT instance FROM channel_onboarding_claims')).rows.length, 0);
+  } finally { releaseCreate?.(); await f.close(); }
+});
+
+test('onboarding rejects a WAHA session already assigned through another instance or the CLI', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'CLI Company', instance: 'cli-instance',
+      session: 'shared-session', webhookToken: 'c'.repeat(64) })));
+    const originHeaders = { host: 'admin.test', origin: 'https://admin.test' };
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: originHeaders,
+      payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { ...originHeaders, cookie: String(login.headers['set-cookie']).split(';')[0]!, 'x-admin-action': '1' };
+    const response = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers,
+      payload: { company: 'Panel Company', instance: 'ui-instance', session: 'shared-session' } });
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(response.json(), { error: 'channel_already_registered' });
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sessions')).length, 0,
+      'a persisted mapping from any instance must block WAHA mutation');
+    assert.deepEqual((await f.pg.query('SELECT name FROM organizations')).rows, [{ name: 'CLI Company' }]);
+    assert.deepEqual((await f.pg.query('SELECT instance, session FROM channels')).rows,
+      [{ instance: 'cli-instance', session: 'shared-session' }]);
+    await assert.rejects(createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Second CLI Company',
+      instance: 'another-cli-instance', session: 'shared-session', webhookToken: 'd'.repeat(64) }))),
+    /WAHA session is already assigned/);
+    await assert.rejects(f.pg.query(`INSERT INTO channels(id, organization_id, instance, session, token_hash)
+      SELECT $1, organization_id, 'direct-db-instance', session, $2 FROM channels WHERE session = $3`,
+      [randomUUID(), tokenHash('e'.repeat(64)), 'shared-session']));
+  } finally { await f.close(); }
+});
+
+test('failed WAHA session creation releases its onboarding reservation for retry', async () => {
+  const f = await fixture();
+  try {
+    const originHeaders = { host: 'admin.test', origin: 'https://admin.test' };
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: originHeaders,
+      payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { ...originHeaders, cookie: String(login.headers['set-cookie']).split(';')[0]!, 'x-admin-action': '1' };
+    const payload = { company: 'Empresa Retry', instance: 'principal', session: 'retry-session' };
+    f.setBeforeSessionCreate(async () => { throw new Error('simulated WAHA create failure'); });
+    const failed = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers, payload });
+    assert.equal(failed.statusCode, 503);
+    assert.equal((await f.pg.query('SELECT session FROM channel_onboarding_claims')).rows.length, 0);
+    assert.equal((await f.pg.query('SELECT id FROM organizations')).rows.length, 0);
+
+    f.setBeforeSessionCreate(async () => {});
+    const retried = await f.app.inject({ method: 'POST', url: '/admin/api/channels', headers, payload });
+    assert.equal(retried.statusCode, 201);
+    assert.equal((await f.pg.query('SELECT session FROM channels WHERE session = $1', [payload.session])).rows.length, 1);
+    assert.equal((await f.pg.query('SELECT session FROM channel_onboarding_claims')).rows.length, 0);
   } finally { await f.close(); }
 });

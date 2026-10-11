@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
-import { createDatabase, type Database } from './db.js';
+import { createDatabase, type Connection, type Database } from './db.js';
 import { parseCompanyAIConfig, type CompanyAIConfig } from './ai-config.js';
 import { setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
@@ -36,18 +36,29 @@ export function parseCompanyOnboarding(input: string): CompanyOnboarding {
 
 export async function createCompany(db: Database, config: CompanyOnboarding): Promise<void> {
   await db.transaction(async tx => {
-    const organizationId = randomUUID();
-    await tx.query(
-      `INSERT INTO organizations(id, name, ai_enabled, ai_model, ai_business_data, ai_tone, ai_instructions)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [organizationId, config.name, config.ai.enabled, config.ai.model, JSON.stringify(config.ai.businessData), config.ai.tone, config.ai.instructions],
-    );
-    await tx.query(
-      `INSERT INTO channels(id, organization_id, instance, session, token_hash, automation_scope)
-       VALUES ($1,$2,$3,$4,$5,'disabled')`,
-      [randomUUID(), organizationId, config.instance, config.session, tokenHash(config.webhookToken)],
-    );
+    const reservation = await tx.query<{ session: string }>(
+      `INSERT INTO channel_onboarding_claims(instance, session) VALUES ($1, $2)
+       ON CONFLICT (session) DO NOTHING RETURNING session`, [config.instance, config.session]);
+    if (!reservation.rows.length) throw new Error('WAHA session is already reserved');
+    try { await insertCompany(tx, config); }
+    finally { await tx.query('DELETE FROM channel_onboarding_claims WHERE session = $1', [config.session]); }
   });
+}
+
+export async function insertCompany(tx: Connection, config: CompanyOnboarding): Promise<void> {
+  const existing = await tx.query<{ id: string }>('SELECT id FROM channels WHERE session = $1 LIMIT 1', [config.session]);
+  if (existing.rows.length) throw new Error('WAHA session is already assigned to a channel');
+  const organizationId = randomUUID();
+  await tx.query(
+    `INSERT INTO organizations(id, name, ai_enabled, ai_model, ai_business_data, ai_tone, ai_instructions)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [organizationId, config.name, config.ai.enabled, config.ai.model, JSON.stringify(config.ai.businessData), config.ai.tone, config.ai.instructions],
+  );
+  await tx.query(
+    `INSERT INTO channels(id, organization_id, instance, session, token_hash, automation_scope)
+     VALUES ($1,$2,$3,$4,$5,'disabled')`,
+    [randomUUID(), organizationId, config.instance, config.session, tokenHash(config.webhookToken)],
+  );
 }
 
 export async function configureCompanyAI(
@@ -130,7 +141,7 @@ async function main() {
     }
   } catch (error) {
     const message = error instanceof Error && error.message.startsWith('Usage:') ? error.message
-      : error instanceof Error && /requires|takes no extra|exact direct chat/.test(error.message) ? error.message
+      : error instanceof Error && /requires|takes no extra|exact direct chat|WAHA session is already/.test(error.message) ? error.message
       : 'Company administration failed; check input, channel mapping and database migration';
     console.error(message);
     process.exitCode = 1;
