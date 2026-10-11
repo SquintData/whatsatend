@@ -23,7 +23,7 @@ export async function setChannelScope(
     if (scope === 'disabled') {
       await tx.query(`UPDATE conversations SET mode = 'monitoring', automation_epoch = automation_epoch + 1,
         automation_started_at = NULL,
-        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
         WHERE channel_id = $1 AND mode = 'auto'`, [id]);
     }
   });

@@ -16,6 +16,7 @@ async function fixture(automation: Automation = disabledAutomation) {
   await pg.exec(await readFile(new URL('../sql/004_company_ai.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/005_channel_automation_scope.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/006_manual_send_claim.sql', import.meta.url), 'utf8'));
+  await pg.exec(await readFile(new URL('../sql/007_reaction_timestamp_precision.sql', import.meta.url), 'utf8'));
   const database: Database = {
     query: async <T>(sql: string, values?: unknown[]) => pg.query<T>(sql, values),
     transaction: fn => pg.transaction(tx => fn({
@@ -375,6 +376,45 @@ test('employee reaction resumes without sending history; duplicate survives rest
     assert.equal((await f.send(reactionEvent('delayed-old-reaction', now + 2))).json().status, 'ignored_state_or_timestamp');
     assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE chat_id = $1', [enabled.chatId])).rows[0]!.mode, 'human');
     assert.equal((await f.send(reactionEvent('new-reaction', now + 4))).json().status, 'resumed');
+  } finally { await f.close(); }
+});
+
+test('official decimal WAHA reaction without source resumes and enables only a later AI reply', async () => {
+  const f = await armed();
+  try {
+    await f.store.control('pause');
+    const now = Math.floor(Date.now() / 1000);
+    const timestamp = now + 1.853;
+    const { source: _source, ...payload } = reactionEvent('official-decimal-reaction', timestamp).payload;
+    const event = { event: 'message.reaction', session: enabled.session, payload };
+
+    const resumed = await f.send(event);
+    assert.equal(resumed.statusCode, 200);
+    assert.equal(resumed.json().status, 'resumed');
+    const storedReaction = await f.pg.query<{ provider_timestamp: string }>(
+      "SELECT provider_timestamp::text FROM reaction_commands WHERE provider_event_id = 'official-decimal-reaction'");
+    assert.equal(storedReaction.rows[0]!.provider_timestamp, timestamp.toFixed(3));
+    const control = await f.pg.query<{ control_timestamp: string }>(
+      'SELECT control_timestamp::text FROM conversations WHERE chat_id = $1', [enabled.chatId]);
+    assert.equal(control.rows[0]!.control_timestamp, timestamp.toFixed(3));
+
+    await f.pg.query(`UPDATE organizations SET ai_enabled = true, ai_model = 'test-model', ai_business_data = '{"faq":"isolated"}'::jsonb WHERE id = $1`, [f.companies[0]]);
+    const nextMessage = Math.floor(timestamp + 2);
+    await f.send(f.incoming('after-decimal-reaction', nextMessage));
+    let generated = '';
+    let sent = '';
+    const worker = new Store(f.database, enabled, {
+      async generate(context) {
+        generated = context.message;
+        return { decision: 'reply', reply: 'AI reply', handoffReason: null, inputTokens: 2, outputTokens: 2 };
+      },
+    });
+    assert.equal(await worker.processNext({ async send(request) { sent = request.text; return { id: 'ai-after-reaction' }; } }), true);
+    assert.equal(generated, 'Olá');
+    assert.equal(sent, 'AI reply');
+
+    const invalid = await f.send({ ...event, payload: { ...payload, id: 'invalid-precision', timestamp: now + 1.8535 } });
+    assert.equal(invalid.statusCode, 400);
   } finally { await f.close(); }
 });
 
