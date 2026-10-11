@@ -51,8 +51,8 @@ export class Store {
       const scope = activeChannel.rows[0];
       if (!scope?.active || !scope.organization_active) throw new Error('Webhook channel is no longer active');
       const timestamp = message.timestamp;
-      const recent = timestamp !== undefined && timestamp >= Math.floor(Date.now() / 1000) - 120
-        && timestamp <= Math.floor(Date.now() / 1000) + 30;
+      const now = Date.now() / 1000;
+      const recent = timestamp !== undefined && timestamp >= now - 120 && timestamp <= now + 30;
       const activatedAt = scope.automation_activated_at ? Math.ceil(new Date(scope.automation_activated_at).getTime() / 1000) : Number.POSITIVE_INFINITY;
       const eligible = this.automation.enabled && !message.fromMe && recent && timestamp! >= activatedAt
         && channelChatAllowed(scope.automation_scope, scope.automation_test_chat_id, chatId);
@@ -69,7 +69,7 @@ export class Store {
            automation_started_at, control_timestamp)
          VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN 'auto' ELSE 'monitoring' END,
            CASE WHEN $5 THEN 1 ELSE 0 END, CASE WHEN $5 THEN to_timestamp($6) ELSE NULL END,
-           CASE WHEN $5 THEN floor(extract(epoch FROM now()))::bigint ELSE 0 END)
+           CASE WHEN $5 THEN extract(epoch FROM now()) ELSE 0 END)
          ON CONFLICT (channel_id, chat_id) DO UPDATE SET
            chat_id = EXCLUDED.chat_id,
            mode = CASE WHEN conversations.mode = 'monitoring' AND $5 THEN 'auto' ELSE conversations.mode END,
@@ -78,7 +78,7 @@ export class Store {
            automation_started_at = CASE WHEN conversations.mode = 'monitoring' AND $5
            THEN to_timestamp($6) ELSE conversations.automation_started_at END,
            control_timestamp = CASE WHEN conversations.mode = 'monitoring' AND $5
-             THEN GREATEST(conversations.control_timestamp, floor(extract(epoch FROM now()))::bigint)
+             THEN GREATEST(conversations.control_timestamp, extract(epoch FROM now()))
              ELSE conversations.control_timestamp END
         RETURNING id`, [randomUUID(), channel.organization_id, channel.id, chatId, eligible, timestamp ?? 0],
       );
@@ -94,7 +94,7 @@ export class Store {
       if (inserted.rows.length && message.fromMe) {
         await tx.query(
           `UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-           control_timestamp = GREATEST(control_timestamp, $3, floor(extract(epoch FROM now()))::bigint)
+           control_timestamp = GREATEST(control_timestamp, $3, extract(epoch FROM now()))
            WHERE id = $1 AND organization_id = $2`,
           [conversationId, channel.organization_id, message.timestamp ?? 0],
         );
@@ -134,7 +134,7 @@ export class Store {
       const row = conversation.rows[0];
       if (!row || !directChat(row.chat_id)) return undefined;
       await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
         [conversationId, scopedChannel.organization_id, scopedChannel.id]);
       await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
@@ -165,7 +165,7 @@ export class Store {
       // A stale claim expires only when an operator explicitly submits again; no worker retries manual sends.
       await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
         manual_send_started_at = now(),
-        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
         [conversationId, scopedChannel.organization_id, scopedChannel.id]);
       await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
@@ -187,7 +187,7 @@ export class Store {
       if (conversation.rows[0]?.chat_id !== target.chatId) throw new Error('Conversation changed during manual send');
       await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
         manual_send_started_at = NULL,
-        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
         [target.conversationId, target.organizationId, target.channelId]);
       await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
@@ -195,7 +195,7 @@ export class Store {
         [target.organizationId, target.channelId, target.conversationId]);
       await tx.query(`INSERT INTO messages(id, organization_id, channel_id, conversation_id,
         provider_message_id, direction, body, provider_timestamp)
-        VALUES ($1,$2,$3,$4,$5,'outgoing',$6,floor(extract(epoch FROM now()))::bigint)
+        VALUES ($1,$2,$3,$4,$5,'outgoing',$6,extract(epoch FROM now()))
         ON CONFLICT (channel_id, provider_message_id) DO NOTHING`,
         [randomUUID(), target.organizationId, target.channelId, target.conversationId, providerMessageId, body]);
     });
@@ -207,7 +207,7 @@ export class Store {
         [target.channelId, target.organizationId]);
       await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
         manual_send_started_at = NULL,
-        control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+        control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3`,
         [target.conversationId, target.organizationId, target.channelId]);
       await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
@@ -217,7 +217,7 @@ export class Store {
   }
 
   async react(channel: Channel, reaction: Reaction): Promise<string> {
-    if (!reaction.fromMe || reaction.source !== 'app' || reaction.reaction.text !== '🤖') return 'ignored_reaction';
+    if (!reaction.fromMe || (reaction.source !== undefined && reaction.source !== 'app') || reaction.reaction.text !== '🤖') return 'ignored_reaction';
     if (!this.automation.enabled) return 'disabled_scope';
     return this.db.transaction(async tx => {
       const active = await tx.query<{ automation_scope: 'disabled' | 'test' | 'all'; automation_test_chat_id: string | null; automation_activated_at: Date | null }>(
@@ -226,7 +226,7 @@ export class Store {
         [channel.id, channel.organization_id]);
       const scope = active.rows[0];
       if (!scope || scope.automation_scope === 'disabled') return 'disabled_scope';
-      if (!scope.automation_activated_at || reaction.timestamp < Math.ceil(new Date(scope.automation_activated_at).getTime() / 1000)) {
+      if (!scope.automation_activated_at || reaction.timestamp < new Date(scope.automation_activated_at).getTime() / 1000) {
         return 'ignored_state_or_timestamp';
       }
       // Resolve the reacted-to message inside this authenticated tenant/channel.
@@ -273,7 +273,7 @@ export class Store {
       const conversations = await tx.query<{ id: string }>(
         `UPDATE conversations SET mode = $1, automation_epoch = automation_epoch + 1,
          automation_started_at = CASE WHEN $1 = 'auto' THEN now() ELSE automation_started_at END,
-         control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+         control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
          WHERE channel_id = $2 AND chat_id = $3 RETURNING id`,
         [action === 'resume' ? 'auto' : 'human', channel.rows[0].id, settings.chatId],
       );
@@ -299,7 +299,7 @@ export class Store {
         );
         for (const job of jobs.rows) {
           await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-            control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint)
+            control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
             WHERE id = $1 AND automation_epoch = $2`, [job.conversation_id, job.epoch]);
           await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
             WHERE conversation_id = $1 AND epoch = $2 AND state = 'pending'`, [job.conversation_id, job.epoch]);
@@ -445,7 +445,7 @@ export class Store {
       }
       if (aiDecision?.decision === 'handoff') {
         await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-          control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1`, [job.conversation_id]);
+          control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now())) WHERE id = $1`, [job.conversation_id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE id = $1", [job.id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
         return;
@@ -457,7 +457,7 @@ export class Store {
       } catch (error) {
         const outcome = error instanceof SendError ? error.outcome : 'uncertain';
         await tx.query('UPDATE reply_jobs SET state = $1, completed_at = now() WHERE id = $2', [outcome, job.id]);
-        await tx.query("UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1, control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1", [job.conversation_id]);
+        await tx.query("UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1, control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now())) WHERE id = $1", [job.conversation_id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
         return;
       }
@@ -484,7 +484,7 @@ export class Store {
       if (conversation.rows[0]?.mode === 'auto' && conversation.rows[0].automation_epoch === job.epoch
         && current.rows[0].epoch === job.epoch) {
         await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-          control_timestamp = GREATEST(control_timestamp, floor(extract(epoch FROM now()))::bigint) WHERE id = $1`, [job.conversation_id]);
+          control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now())) WHERE id = $1`, [job.conversation_id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
       }
     });

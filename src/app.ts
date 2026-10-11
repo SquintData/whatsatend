@@ -17,8 +17,11 @@ const messageSchema = z.object({
   _data: z.unknown().optional(),
 });
 const gowsChatSchema = z.object({ Info: z.object({ Chat: z.string().min(1).max(255) }) });
+const providerTimestampSchema = z.number().finite().min(0).max(9_000_000_000_000)
+  .refine(value => Number.isSafeInteger(value * 1000), 'timestamp must have millisecond precision')
+  .transform(value => Math.round(value * 1000) / 1000);
 const reactionSchema = z.object({
-  id: z.string().min(1).max(512), timestamp: z.number().int().nonnegative().safe(),
+  id: z.string().min(1).max(512), timestamp: providerTimestampSchema,
   fromMe: z.boolean(), source: z.string().max(32).optional(),
   reaction: z.object({ text: z.string().max(32).nullish().transform(value => value ?? ''), messageId: z.string().min(1).max(512) }),
 });
