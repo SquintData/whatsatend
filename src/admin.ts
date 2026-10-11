@@ -25,7 +25,8 @@ function renderReplyAttentionItems(items,target,openConversation,documentRef=doc
   for(const label of ['Organiza\\u00e7\\u00e3o','Canal','Conversa','Status','Data/hora UTC','']){const cell=documentRef.createElement('th');cell.textContent=label;headRow.append(cell)}
   head.append(headRow);table.append(head);const body=documentRef.createElement('tbody');
   for(const item of items){const row=documentRef.createElement('tr');
-    const values=[item.organization,item.instance+' / '+item.session,item.conversationId,item.status,
+    const status=item.status==='ai_handoff'?'Handoff IA'+(item.reason?' · '+item.reason:''):item.status;
+    const values=[item.organization,item.instance+' / '+item.session,item.conversationId,status,
       new Date(item.attentionAt).toLocaleString('pt-BR',{timeZone:'UTC'})];
     for(const value of values){const cell=documentRef.createElement('td');cell.textContent=String(value);row.append(cell)}
     const actions=documentRef.createElement('td'),link=documentRef.createElement('a');link.href='#conversation-detail';link.textContent='Abrir conversa';
@@ -208,19 +209,33 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     try {
       const result = await db.query<{
         organization: string; instance: string; session: string; conversation_id: string;
-        status: 'failed' | 'uncertain'; attention_at: Date;
-      }>(`SELECT o.name AS organization, ch.instance, ch.session, cv.id AS conversation_id,
-          j.state AS status, coalesce(j.completed_at, j.created_at) AS attention_at
-        FROM reply_jobs j
-        JOIN organizations o ON o.id = j.organization_id
-        JOIN channels ch ON ch.id = j.channel_id AND ch.organization_id = j.organization_id
-        JOIN conversations cv ON cv.id = j.conversation_id AND cv.organization_id = j.organization_id
-          AND cv.channel_id = j.channel_id
-        WHERE j.state IN ('failed', 'uncertain')
-        ORDER BY coalesce(j.completed_at, j.created_at) DESC, j.id DESC
+        status: 'failed' | 'uncertain' | 'ai_handoff'; attention_at: Date; reason: string | null;
+      }>(`SELECT item.organization, item.instance, item.session, item.conversation_id,
+          item.status, item.attention_at, item.reason
+        FROM (
+          SELECT o.name AS organization, ch.instance, ch.session, cv.id AS conversation_id,
+            j.state AS status, coalesce(j.completed_at, j.created_at) AS attention_at, NULL::text AS reason,
+            j.id AS tie_breaker
+          FROM reply_jobs j
+          JOIN organizations o ON o.id = j.organization_id
+          JOIN channels ch ON ch.id = j.channel_id AND ch.organization_id = j.organization_id
+          JOIN conversations cv ON cv.id = j.conversation_id AND cv.organization_id = j.organization_id
+            AND cv.channel_id = j.channel_id
+          WHERE j.state IN ('failed', 'uncertain')
+          UNION ALL
+          SELECT o.name AS organization, ch.instance, ch.session, cv.id AS conversation_id,
+            'ai_handoff'::text AS status, cv.ai_handoff_at AS attention_at, cv.ai_handoff_reason AS reason,
+            cv.id AS tie_breaker
+          FROM conversations cv
+          JOIN organizations o ON o.id = cv.organization_id
+          JOIN channels ch ON ch.id = cv.channel_id AND ch.organization_id = cv.organization_id
+          WHERE cv.ai_handoff_reason IS NOT NULL
+        ) item
+        ORDER BY item.attention_at DESC, item.tie_breaker DESC, item.status
         LIMIT 50`);
       return { items: result.rows.map(row => ({ organization: row.organization, instance: row.instance,
-        session: row.session, conversationId: row.conversation_id, status: row.status, attentionAt: row.attention_at })) };
+        session: row.session, conversationId: row.conversation_id, status: row.status, reason: row.reason,
+        attentionAt: row.attention_at })) };
     } catch { return reject(reply, 503); }
   });
   app.get('/admin/api/conversations', async (request, reply) => {

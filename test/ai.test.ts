@@ -12,7 +12,7 @@ const chatIds = ['5511999999991@c.us', '5511999999992@c.us'] as const;
 
 async function fixture(aiEnabled: boolean[] = [true, true]) {
   const pg = new PGlite();
-  for (const name of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql']) {
+  for (const name of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql', '007_reaction_timestamp_precision.sql', '008_channel_onboarding_claim.sql', '009_global_waha_session_unique.sql', '010_ai_handoff_attention.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${name}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -153,6 +153,20 @@ test('provider failures and explicit handoff pause the conversation without inve
         assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.mode, 'human');
         assert.equal((await f.pg.query('SELECT * FROM messages WHERE direction = \'outgoing\'')).rows.length, 0);
         assert.equal((await f.pg.query('SELECT * FROM ai_usage')).rows.length, name === 'explicit handoff' ? 1 : 0);
+        const handoff = await f.pg.query<{ ai_handoff_reason: string | null; ai_handoff_at: Date | null }>(
+          'SELECT ai_handoff_reason, ai_handoff_at FROM conversations WHERE channel_id = $1', [f.channels[0]]);
+        assert.equal(handoff.rows[0]!.ai_handoff_reason, name === 'explicit handoff' ? 'needs_person' : null);
+        assert.equal(handoff.rows[0]!.ai_handoff_at !== null, name === 'explicit handoff');
+        if (name === 'explicit handoff') {
+          const resumed = await store.react({ id: f.channels[0]!, organization_id: f.organizations[0]!, session: 'session-0' }, {
+            id: 'handoff-resume', timestamp: Date.now() / 1000 + 1, fromMe: true, source: 'app',
+            reaction: { text: '\u{1F916}', messageId: `failed-${name}` },
+          });
+          assert.equal(resumed, 'resumed');
+          const cleared = await f.pg.query<{ ai_handoff_reason: string | null; ai_handoff_at: Date | null }>(
+            'SELECT ai_handoff_reason, ai_handoff_at FROM conversations WHERE channel_id = $1', [f.channels[0]]);
+          assert.deepEqual(cleared.rows[0], { ai_handoff_reason: null, ai_handoff_at: null });
+        }
       } finally { await f.close(); }
     });
   }

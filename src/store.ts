@@ -246,6 +246,7 @@ export class Store {
       if (!inserted.rows.length) return 'duplicate';
       const resumed = await tx.query(
         `UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
+         ai_handoff_reason = NULL, ai_handoff_at = NULL,
          automation_started_at = GREATEST(now(), to_timestamp($2 + 1)), control_timestamp = $2
          WHERE id = $1 AND mode IN ('human','monitoring') AND $2 > control_timestamp
          AND $2 >= extract(epoch FROM now()) - 120 AND $2 <= extract(epoch FROM now()) + 30
@@ -272,6 +273,8 @@ export class Store {
       if (!channel.rows[0]) throw new Error('Active channel not found');
       const conversations = await tx.query<{ id: string }>(
         `UPDATE conversations SET mode = $1, automation_epoch = automation_epoch + 1,
+         ai_handoff_reason = CASE WHEN $1 = 'auto' THEN NULL ELSE ai_handoff_reason END,
+         ai_handoff_at = CASE WHEN $1 = 'auto' THEN NULL ELSE ai_handoff_at END,
          automation_started_at = CASE WHEN $1 = 'auto' THEN now() ELSE automation_started_at END,
          control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now()))
          WHERE channel_id = $2 AND chat_id = $3 RETURNING id`,
@@ -445,7 +448,9 @@ export class Store {
       }
       if (aiDecision?.decision === 'handoff') {
         await tx.query(`UPDATE conversations SET mode = 'human', automation_epoch = automation_epoch + 1,
-          control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now())) WHERE id = $1`, [job.conversation_id]);
+          ai_handoff_reason = $2, ai_handoff_at = now(),
+          control_timestamp = GREATEST(control_timestamp, extract(epoch FROM now())) WHERE id = $1`,
+          [job.conversation_id, aiDecision.handoffReason]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE id = $1", [job.id]);
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE conversation_id = $1 AND state = 'pending'", [job.conversation_id]);
         return;
