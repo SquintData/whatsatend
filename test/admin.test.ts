@@ -25,7 +25,7 @@ async function fixture(withAdmin = true) {
   let beforeManualSend: (() => Promise<void>) | undefined;
   let manualSendStatus = 200;
   const wahaCalls: Array<{ url: string; init: RequestInit }> = [];
-  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql']) {
+  for (const file of ['001_initial.sql', '002_fixed_reply.sql', '003_reaction_resume.sql', '004_company_ai.sql', '005_channel_automation_scope.sql', '006_manual_send_claim.sql']) {
     await pg.exec(await readFile(new URL(`../sql/${file}`, import.meta.url), 'utf8'));
   }
   const db: Database = {
@@ -142,6 +142,41 @@ test('admin panel requires secret login, hides channel tokens, and updates only 
   } finally { await f.close(); }
 });
 
+test('concurrent manual replies reserve a conversation atomically and only one reaches WAHA', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Empresa', instance: 'principal', session: 'a', webhookToken: 'a'.repeat(64) })));
+    const channel = (await f.pg.query<{ id: string; organization_id: string }>('SELECT id, organization_id FROM channels')).rows[0]!;
+    const conversationId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id,organization_id,channel_id,chat_id,mode,automation_epoch)
+      VALUES ($1,$2,$3,'5511999999999@c.us','auto',2)`, [conversationId, channel.organization_id, channel.id]);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+    let entered!: () => void;
+    let release!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let sendCalls = 0;
+    f.setBeforeManualSend(async () => { if (++sendCalls === 1) { entered(); await barrier; } });
+    const payload = { instance: 'principal', session: 'a', id: conversationId, text: 'One answer' };
+    const first = f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers, payload });
+    await sending;
+    const second = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers, payload });
+    assert.equal(second.statusCode, 409, 'the concurrent request must be rejected before reaching WAHA');
+    release();
+    assert.equal((await first).statusCode, 200);
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sendText')).length, 1);
+    const outgoing = await f.pg.query<{ count: number; mode: string; manual_send_in_flight: boolean }>(
+      `SELECT count(*)::int AS count,cv.mode,coalesce(cv.manual_send_started_at > now() - interval '1 minute',false) AS manual_send_in_flight
+       FROM messages m JOIN conversations cv ON cv.id=m.conversation_id
+       WHERE cv.id=$1 AND m.direction='outgoing' GROUP BY cv.mode,cv.manual_send_started_at`, [conversationId]);
+    assert.deepEqual(outgoing.rows[0], { count: 1, mode: 'human', manual_send_in_flight: false });
+  } finally { await f.close(); }
+});
+
 test('manual reply authenticates, isolates channel, pauses before WAHA and records only confirmed outgoing messages', async () => {
   const f = await fixture();
   try {
@@ -208,10 +243,12 @@ test('manual reply authenticates, isolates channel, pauses before WAHA and recor
         to: '5511999999999@c.us', fromMe: true, body: 'Manual reply' } } });
     assert.equal(echo.statusCode, 200);
     assert.equal(echo.json().status, 'duplicate', 'the later WAHA echo must deduplicate the already recorded send');
-    const stored = await f.pg.query<{ mode: string; direction: string; body: string; provider_message_id: string }>(
-      `SELECT cv.mode,m.direction,m.body,m.provider_message_id FROM conversations cv JOIN messages m ON m.conversation_id=cv.id
+    const stored = await f.pg.query<{ mode: string; manual_send_in_flight: boolean; direction: string; body: string; provider_message_id: string }>(
+      `SELECT cv.mode,coalesce(cv.manual_send_started_at > now() - interval '1 minute',false) AS manual_send_in_flight,
+       m.direction,m.body,m.provider_message_id FROM conversations cv JOIN messages m ON m.conversation_id=cv.id
        WHERE cv.id=$1 AND m.provider_message_id='manual-out-1'`, [conversationA]);
-    assert.deepEqual(stored.rows[0], { mode: 'human', direction: 'outgoing', body: 'Manual reply', provider_message_id: 'manual-out-1' });
+    assert.deepEqual(stored.rows[0], { mode: 'human', manual_send_in_flight: false,
+      direction: 'outgoing', body: 'Manual reply', provider_message_id: 'manual-out-1' });
     const other = await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE id=$1', [conversationB]);
     assert.equal(other.rows[0]!.mode, 'human');
   } finally { await f.close(); }
@@ -235,10 +272,11 @@ test('manual send uncertainty leaves the conversation paused and does not create
       payload: { instance: 'principal', session: 'a', id: conversationId, text: 'Possibly sent' } });
     assert.equal(response.statusCode, 503);
     assert.deepEqual(response.json(), { error: 'send_uncertain', paused: true });
-    const stored = await f.pg.query<{ mode: string; automation_epoch: number; outgoing: number }>(
-      `SELECT cv.mode,cv.automation_epoch,(SELECT count(*)::int FROM messages m WHERE m.conversation_id=cv.id AND m.direction='outgoing') AS outgoing
+    const stored = await f.pg.query<{ mode: string; automation_epoch: number; manual_send_in_flight: boolean; outgoing: number }>(
+      `SELECT cv.mode,cv.automation_epoch,coalesce(cv.manual_send_started_at > now() - interval '1 minute',false) AS manual_send_in_flight,
+       (SELECT count(*)::int FROM messages m WHERE m.conversation_id=cv.id AND m.direction='outgoing') AS outgoing
        FROM conversations cv WHERE cv.id=$1`, [conversationId]);
-    assert.deepEqual(stored.rows[0], { mode: 'human', automation_epoch: 6, outgoing: 0 });
+    assert.deepEqual(stored.rows[0], { mode: 'human', automation_epoch: 6, manual_send_in_flight: false, outgoing: 0 });
     assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sendText')).length, 1,
       'an uncertain WAHA result is not automatically retried');
   } finally { await f.close(); }

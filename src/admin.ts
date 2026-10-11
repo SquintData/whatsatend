@@ -230,18 +230,23 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
     const parsed = manualReplySchema.safeParse(request.body);
     if (!parsed.success) return reject(reply, 400);
     if (!store || !connections.waha) return reject(reply, 503);
-    let target;
-    try { target = await store.pauseConversation(parsed.data.instance, parsed.data.session, parsed.data.id); }
+    let reservation: Awaited<ReturnType<Store['reserveManualSend']>>;
+    try { reservation = await store.reserveManualSend(parsed.data.instance, parsed.data.session, parsed.data.id); }
     catch { return reject(reply, 503); }
-    if (!target) return reject(reply, 404);
-    if (!target.channelActive || !target.organizationActive) return reject(reply, 409);
+    if (reservation.status === 'not_found') return reject(reply, 404);
+    if (reservation.status === 'in_flight') return reply.code(409).send({ error: 'manual_send_in_progress' });
+    const target = reservation.target;
+    if (!target.channelActive || !target.organizationActive) {
+      try { await store.releaseManualSend(target); } catch { return reject(reply, 503); }
+      return reject(reply, 409);
+    }
     try {
       const sent = await connections.waha.send({ session: target.session, chatId: target.chatId, text: parsed.data.text });
       await store.recordManualOutgoing(target, parsed.data.text, sent.id);
       return { ok: true };
     } catch {
-      // There is no queued retry. Reassert human mode if a concurrent resume raced the WAHA request.
-      try { await store.pauseConversation(parsed.data.instance, parsed.data.session, parsed.data.id); } catch { /* already paused before sending */ }
+      // There is no queued retry. Release this claim and reassert human mode if a concurrent resume raced WAHA.
+      try { await store.releaseManualSend(target); } catch { /* reservation remains fail-closed */ }
       return reply.code(503).send({ error: 'send_uncertain', paused: true });
     }
   });
