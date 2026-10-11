@@ -15,6 +15,7 @@ async function fixture(automation: Automation = disabledAutomation) {
   await pg.exec(await readFile(new URL('../sql/003_reaction_resume.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/004_company_ai.sql', import.meta.url), 'utf8'));
   await pg.exec(await readFile(new URL('../sql/005_channel_automation_scope.sql', import.meta.url), 'utf8'));
+  await pg.exec(await readFile(new URL('../sql/006_manual_send_claim.sql', import.meta.url), 'utf8'));
   const database: Database = {
     query: async <T>(sql: string, values?: unknown[]) => pg.query<T>(sql, values),
     transaction: fn => pg.transaction(tx => fn({

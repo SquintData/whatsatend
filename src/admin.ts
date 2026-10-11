@@ -7,6 +7,7 @@ import { setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
 import { listCompanies, configureCompanyAI, createCompany, parseCompanyOnboarding } from './company-admin.js';
 import type { WahaAdminClient } from './waha-admin.js';
+import type { Store } from './store.js';
 
 const sessionCookie = 'wa_admin';
 const sessionTtlMs = 8 * 60 * 60 * 1000;
@@ -17,7 +18,52 @@ function createQrView(image,objectUrls=URL){let selectedKey='',generation=0,stat
 const root=document.querySelector('#app');
 async function api(url,options={}){const method=(options.method||'GET').toUpperCase();const mutating=['POST','PUT','PATCH','DELETE'].includes(method);const response=await fetch(url,{...options,headers:{...(options.body?{'content-type':'application/json'}:{}),...options.headers,...(mutating?{'x-admin-action':'1'}:{})}});if(!response.ok)throw Error(response.status===401?'Sessão encerrada. Entre novamente.':'Operação não concluída. Confira os dados e tente outra vez.');return response.status===204?null:response.json()}
 function createConversationSearchGuard(){let generation=0,key="";return{begin(nextKey){key=nextKey;return{generation:++generation,key}},isCurrent(request){return request.generation===generation&&request.key===key}}}
-function mountConversationHistory(){if(document.querySelector('#conversation-history'))return;const panel=document.createElement('section');panel.id='conversation-history';panel.className='panel';panel.innerHTML='<h2>Conversas e histórico</h2><form id="conversation-search" class="row"><label>Instância<input name="instance" required maxlength="100"></label><label>Sessão<input name="session" required maxlength="200"></label><button class="primary">Buscar conversas</button></form><p class="muted">Exibe até 25 conversas por página e até 100 mensagens ao abrir uma conversa. O histórico é limitado ao canal selecionado.</p><div id="conversation-list"></div><button id="conversation-next" type="button" hidden>Próxima página</button><section id="conversation-detail" hidden><h3 id="conversation-title"></h3><div id="conversation-messages"></div></section>';root.append(panel);let selection=null;let nextOffset=null;const searchGuard=createConversationSearchGuard(),detailGuard=createConversationSearchGuard();const list=document.querySelector('#conversation-list'),next=document.querySelector('#conversation-next');const load=async(offset=0,append=false)=>{const form=document.querySelector('#conversation-search');selection={instance:form.elements.instance.value.trim(),session:form.elements.session.value.trim()};const request=searchGuard.begin(JSON.stringify([selection.instance,selection.session]));detailGuard.begin(JSON.stringify([selection.instance,selection.session]));document.querySelector('#conversation-detail').hidden=true;try{const page=await api('/admin/api/conversations?'+new URLSearchParams({...selection,limit:'25',offset:String(offset)}));if(!searchGuard.isCurrent(request))return;if(!append)list.replaceChildren();for(const item of page.items){const entry=document.createElement('div');entry.className='row';const summary=document.createElement('span');summary.textContent=item.company+' · '+item.chatId+' · '+item.mode+' · '+String(item.lastMessage||'Sem mensagens').slice(0,180);const open=document.createElement('button');open.type='button';open.textContent='Abrir histórico';open.dataset.conversationId=item.id;entry.append(summary,open);list.append(entry)}if(!page.items.length&&!append)list.textContent='Nenhuma conversa neste canal.';nextOffset=page.nextOffset;next.hidden=nextOffset===null;next.disabled=false;document.querySelector('#conversation-detail').hidden=true}catch{if(!searchGuard.isCurrent(request))return;list.textContent='Não foi possível carregar conversas deste canal.';next.hidden=true}};document.querySelector('#conversation-search').onsubmit=event=>{event.preventDefault();void load()};next.onclick=()=>{if(nextOffset!==null){next.disabled=true;void load(nextOffset,true)}};list.addEventListener('click',async event=>{const button=event.target.closest('button[data-conversation-id]');if(!button||!selection)return;const detailRequest=detailGuard.begin(JSON.stringify([selection.instance,selection.session,button.dataset.conversationId]));try{const detail=await api('/admin/api/conversation?'+new URLSearchParams({...selection,id:button.dataset.conversationId}));if(!detailGuard.isCurrent(detailRequest))return;document.querySelector('#conversation-title').textContent=detail.company+' · '+detail.chatId+' · '+detail.mode;const messages=document.querySelector('#conversation-messages');messages.replaceChildren();for(const message of detail.messages){const item=document.createElement('p');item.textContent=(message.direction==='incoming'?'Contato':'Atendimento')+' · '+String(message.body);messages.append(item)}document.querySelector('#conversation-detail').hidden=false}catch{if(!detailGuard.isCurrent(detailRequest))return;document.querySelector('#conversation-title').textContent='Não foi possível abrir este histórico.';document.querySelector('#conversation-detail').hidden=false}})}
+function mountConversationHistory(){
+  if(document.querySelector('#conversation-history'))return;
+  const panel=document.createElement('section');panel.id='conversation-history';panel.className='panel';
+  panel.innerHTML='<h2>Conversas e hist\u00f3rico</h2><form id="conversation-search" class="row"><label>Inst\u00e2ncia<input name="instance" required maxlength="100"></label><label>Sess\u00e3o<input name="session" required maxlength="200"></label><button class="primary">Buscar conversas</button></form><p class="muted">Exibe at\u00e9 25 conversas por p\u00e1gina e at\u00e9 100 mensagens ao abrir uma conversa. O hist\u00f3rico \u00e9 limitado ao canal selecionado.</p><div id="conversation-list"></div><button id="conversation-next" type="button" hidden>Pr\u00f3xima p\u00e1gina</button><section id="conversation-detail" hidden><h3 id="conversation-title"></h3><div id="conversation-messages"></div><p class="muted">Assumir pausa novas respostas autom\u00e1ticas. Envios WAHA j\u00e1 iniciados n\u00e3o podem ser recolhidos.</p><button id="conversation-pause" type="button">Assumir / pausar automa\u00e7\u00e3o</button><form id="manual-reply-form"><label>Resposta manual<textarea name="text" maxlength="16000" required></textarea></label><button id="manual-reply-button" class="primary">Enviar resposta manual</button></form><p id="manual-reply-status" role="status"></p></section>';
+  root.append(panel);let selection=null,nextOffset=null,activeDetail=null;
+  const searchGuard=createConversationSearchGuard(),detailGuard=createConversationSearchGuard();
+  const list=document.querySelector('#conversation-list'),next=document.querySelector('#conversation-next'),detailPanel=document.querySelector('#conversation-detail');
+  const showDetail=async(id)=>{
+    if(!selection)return;const chosen={...selection,id};const request=detailGuard.begin(JSON.stringify([chosen.instance,chosen.session,id]));activeDetail=null;detailPanel.hidden=true;
+    try{
+      const value=await api('/admin/api/conversation?'+new URLSearchParams(chosen));
+      if(!detailGuard.isCurrent(request))return;
+      activeDetail={chosen,request};document.querySelector('#conversation-title').textContent=value.company+' \u00b7 '+value.chatId+' \u00b7 '+value.mode;
+      const messages=document.querySelector('#conversation-messages');messages.replaceChildren();
+      for(const message of value.messages){const item=document.createElement('p');item.textContent=(message.direction==='incoming'?'Contato':'Atendimento')+' \u00b7 '+String(message.body);messages.append(item)}
+      document.querySelector('#conversation-pause').textContent=value.mode==='human'?'Conversa pausada':'Assumir / pausar automa\u00e7\u00e3o';
+      document.querySelector('#manual-reply-status').textContent='';detailPanel.hidden=false;
+    }catch{if(!detailGuard.isCurrent(request))return;document.querySelector('#conversation-title').textContent='N\u00e3o foi poss\u00edvel abrir este hist\u00f3rico.';detailPanel.hidden=false}
+  };
+  const load=async(offset=0,append=false)=>{
+    const form=document.querySelector('#conversation-search');selection={instance:form.elements.instance.value.trim(),session:form.elements.session.value.trim()};
+    const request=searchGuard.begin(JSON.stringify([selection.instance,selection.session]));detailGuard.begin(JSON.stringify([selection.instance,selection.session]));activeDetail=null;detailPanel.hidden=true;
+    try{
+      const page=await api('/admin/api/conversations?'+new URLSearchParams({...selection,limit:'25',offset:String(offset)}));
+      if(!searchGuard.isCurrent(request))return;if(!append)list.replaceChildren();
+      for(const item of page.items){const entry=document.createElement('div');entry.className='row';const summary=document.createElement('span');summary.textContent=item.company+' \u00b7 '+item.chatId+' \u00b7 '+item.mode+' \u00b7 '+String(item.lastMessage||'Sem mensagens').slice(0,180);const open=document.createElement('button');open.type='button';open.textContent='Abrir hist\u00f3rico';open.dataset.conversationId=item.id;entry.append(summary,open);list.append(entry)}
+      if(!page.items.length&&!append)list.textContent='Nenhuma conversa neste canal.';nextOffset=page.nextOffset;next.hidden=nextOffset===null;next.disabled=false;
+    }catch{if(!searchGuard.isCurrent(request))return;list.textContent='N\u00e3o foi poss\u00edvel carregar conversas deste canal.';next.hidden=true}
+  };
+  document.querySelector('#conversation-search').onsubmit=event=>{event.preventDefault();void load()};
+  next.onclick=()=>{if(nextOffset!==null){next.disabled=true;void load(nextOffset,true)}};
+  list.addEventListener('click',event=>{const button=event.target.closest('button[data-conversation-id]');if(button)void showDetail(button.dataset.conversationId)});
+  document.querySelector('#conversation-pause').onclick=async()=>{
+    const current=activeDetail;if(!current)return;const button=document.querySelector('#conversation-pause');button.disabled=true;
+    try{await api('/admin/api/conversation/pause',{method:'POST',body:JSON.stringify(current.chosen)});if(activeDetail===current)await showDetail(current.chosen.id)}
+    catch{if(activeDetail===current)document.querySelector('#manual-reply-status').textContent='N\u00e3o foi poss\u00edvel pausar esta conversa.'}
+    finally{button.disabled=false}
+  };
+  document.querySelector('#manual-reply-form').onsubmit=async event=>{
+    event.preventDefault();const current=activeDetail;if(!current)return;const form=event.currentTarget,text=form.elements.text.value;
+    const button=document.querySelector('#manual-reply-button'),status=document.querySelector('#manual-reply-status');button.disabled=true;status.textContent='Pausando automa\u00e7\u00e3o antes do envio...';
+    try{await api('/admin/api/conversation/reply',{method:'POST',body:JSON.stringify({...current.chosen,text})});if(activeDetail===current){status.textContent='Resposta confirmada pelo WAHA.';await showDetail(current.chosen.id)}}
+    catch{if(activeDetail===current)status.textContent='Envio n\u00e3o confirmado. A conversa permanece pausada; confira o WhatsApp antes de enviar novamente.'}
+    finally{button.disabled=false}
+  };
+}
 function mountConversationLinks(){const table=document.querySelector('#table');if(!table||table.dataset.historyLinks)return;table.dataset.historyLinks='true';const addLinks=()=>{for(const row of table.querySelectorAll('tbody tr')){const controls=row.lastElementChild;if(!controls||controls.querySelector('[data-history-channel]'))continue;const pair=(row.cells[1]?.textContent||'').split(' / ');if(pair.length!==2)continue;const button=document.createElement('button');button.type='button';button.textContent='Conversas';button.dataset.historyChannel='true';button.onclick=()=>{const form=document.querySelector('#conversation-search');form.elements.instance.value=pair[0].trim();form.elements.session.value=pair[1].trim();form.requestSubmit()};controls.append(button)}};new MutationObserver(addLinks).observe(table,{childList:true,subtree:true});addLinks()}
 function notice(text){const n=document.querySelector('#notice');if(n)n.textContent=text}
 const dashboardObserver=new MutationObserver(()=>{if(document.querySelector('#create-channel')){mountConversationHistory();mountConversationLinks()}});dashboardObserver.observe(root,{childList:true});
@@ -35,13 +81,15 @@ const conversationsQuerySchema = mappingSchema.extend({
   offset: z.coerce.number().int().min(0).max(10_000).default(0),
 }).strict();
 const conversationQuerySchema = mappingSchema.extend({ id: z.string().uuid() }).strict();
+const conversationMutationSchema = mappingSchema.extend({ id: z.string().uuid() }).strict();
+const manualReplySchema = conversationMutationSchema.extend({ text: z.string().min(1).max(16_000) }).strict();
 const loginSchema = z.object({ secret: z.string().min(1).max(256) }).strict();
 const scopeSchema = mappingSchema.extend({
   scope: z.enum(['disabled', 'test', 'all']), testChatId: z.string().max(255).optional(), confirmAll: z.boolean().optional(),
 }).strict();
 
 export function registerAdminPanel(app: FastifyInstance, db: Database, secret: string,
-  connections: { waha?: WahaAdminClient; publicBaseUrl?: string } = {}) {
+  connections: { waha?: WahaAdminClient; publicBaseUrl?: string } = {}, store?: Store) {
   const secretBytes = Buffer.from(secret);
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; startedAt: number }>();
@@ -164,6 +212,43 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
         messages: messages.rows.reverse().map(message => ({ direction: message.direction, body: message.body,
           timestamp: message.provider_timestamp, receivedAt: message.received_at })) };
     } catch { return reject(reply, 503); }
+  });
+  app.post('/admin/api/conversation/pause', async (request, reply) => {
+    headers(reply); if (!guard(request, reply)) return;
+    if (!ensureMutation(request)) return reject(reply, 400);
+    const parsed = conversationMutationSchema.safeParse(request.body);
+    if (!parsed.success || !store) return reject(reply, parsed.success ? 503 : 400);
+    try {
+      const target = await store.pauseConversation(parsed.data.instance, parsed.data.session, parsed.data.id);
+      if (!target) return reject(reply, 404);
+      return { mode: 'human' };
+    } catch { return reject(reply, 503); }
+  });
+  app.post('/admin/api/conversation/reply', async (request, reply) => {
+    headers(reply); if (!guard(request, reply)) return;
+    if (!ensureMutation(request)) return reject(reply, 400);
+    const parsed = manualReplySchema.safeParse(request.body);
+    if (!parsed.success) return reject(reply, 400);
+    if (!store || !connections.waha) return reject(reply, 503);
+    let reservation: Awaited<ReturnType<Store['reserveManualSend']>>;
+    try { reservation = await store.reserveManualSend(parsed.data.instance, parsed.data.session, parsed.data.id); }
+    catch { return reject(reply, 503); }
+    if (reservation.status === 'not_found') return reject(reply, 404);
+    if (reservation.status === 'in_flight') return reply.code(409).send({ error: 'manual_send_in_progress' });
+    const target = reservation.target;
+    if (!target.channelActive || !target.organizationActive) {
+      try { await store.releaseManualSend(target); } catch { return reject(reply, 503); }
+      return reject(reply, 409);
+    }
+    try {
+      const sent = await connections.waha.send({ session: target.session, chatId: target.chatId, text: parsed.data.text });
+      await store.recordManualOutgoing(target, parsed.data.text, sent.id);
+      return { ok: true };
+    } catch {
+      // There is no queued retry. Release this claim and reassert human mode if a concurrent resume raced WAHA.
+      try { await store.releaseManualSend(target); } catch { /* reservation remains fail-closed */ }
+      return reply.code(503).send({ error: 'send_uncertain', paused: true });
+    }
   });
   const channelForConnection = async (instance: string, session: string) => {
     const result = await db.query<{ id: string }>(

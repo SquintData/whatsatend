@@ -42,7 +42,7 @@ export function buildApp(store: Store, logger = false, admin?: {
   });
   app.get('/health/live', async () => ({ status: 'ok' }));
   app.get('/health/ready', async () => { await store.ready(); return { status: 'ready' }; });
-  if (admin?.secret) registerAdminPanel(app, admin.db, admin.secret, admin);
+  if (admin?.secret) registerAdminPanel(app, admin.db, admin.secret, admin, store);
 
   app.post<{ Params: { instance: string } }>('/webhooks/waha/:instance', async (request, reply) => {
     const token = request.headers['x-webhook-token'];
