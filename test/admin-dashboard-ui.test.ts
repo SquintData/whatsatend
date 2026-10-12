@@ -117,6 +117,80 @@ test('channel workspace loading prevents mapping mismatch and ignores stale resp
   assert.equal(selected, null, 'a cancelled loading state has no save mapping');
 });
 
+test('real channel open wiring navigates, fetches, fills the form, and still cancels on later navigation', async () => {
+  const sourceBetween = (startMarker: string, endMarker: string) => {
+    const start = adminPage.indexOf(startMarker);
+    const end = adminPage.indexOf(endMarker, start + 1);
+    assert.ok(start >= 0 && end > start, `dashboard source must contain ${startMarker}`);
+    return adminPage.slice(start, end);
+  };
+  const loaderSource = sourceBetween('function createChannelWorkspaceLoader()', '\nfunction openAttentionConversation(');
+  const viewSource = sourceBetween('function showView(view)', '\nfunction createQrView(');
+  const navigationSource = sourceBetween('function navigateToView(view', "\ndocument.querySelectorAll('[data-view-nav]')");
+  const cancellationSource = sourceBetween('function cancelChannelLoad()', '\nfunction showCompanyList()');
+  const openSource = sourceBetween('const open=(instance,session)=>channelWorkspaceLoader', '\nlet connectionQr');
+  const panels = views.map(view => ({ dataset: { viewPanel: view }, hidden: true }));
+  const navigation = views.map(view => ({ dataset: { viewNav: view }, setAttribute() {}, removeAttribute() {} }));
+  const elements = new Map<string, { hidden: boolean; textContent: string; value: string; checked: boolean }>(
+    ['#page-title', '#company-load-status', '#table', '#company-list-panel', '#company-create-panel', '#editor',
+      '#title', '#enabled', '#model', '#data', '#tone', '#instructions', '#scope-value', '#test-chat']
+      .map(selector => [selector, { hidden: false, textContent: '', value: '', checked: false }]));
+  const documentRef = {
+    querySelectorAll(selector: string) {
+      if (selector === '[data-view-panel]') return panels;
+      if (selector === '[data-view-nav]') return navigation;
+      throw new Error(`unexpected querySelectorAll: ${selector}`);
+    },
+    querySelector(selector: string) {
+      const element = elements.get(selector);
+      assert.ok(element, `unexpected selector: ${selector}`);
+      return element;
+    },
+  };
+  const pending = new Map<string, (value: unknown) => void>();
+  const script = `(()=>{${loaderSource}${viewSource}
+    let selected=null,channelLoadPending=false;
+    const channelWorkspaceLoader=createChannelWorkspaceLoader();
+    function cancelChannelLoad(){${cancellationSource.slice(cancellationSource.indexOf('{') + 1, -1)}}
+    function navigateToView(view,preserveChannelLoad=false){${navigationSource.slice(navigationSource.indexOf('{') + 1, -1)}}
+    function activateCompanyTab(){}
+    function notice(){}
+    ${openSource}
+    return {open,navigateToView,state:()=>({selected,channelLoadPending})};
+  })()`;
+  const dashboard = runInNewContext(script, {
+    document: documentRef,
+    URLSearchParams,
+    api: (url: string) => new Promise(resolve => pending.set(new URLSearchParams(url.split('?')[1]).get('session')!, resolve)),
+  }) as {
+    open(instance: string, session: string): Promise<boolean>;
+    navigateToView(view: string): boolean;
+    state(): { selected: { instance: string; session: string } | null; channelLoadPending: boolean };
+  };
+  const response = { company: 'Company A', ai: { enabled: true, model: 'model-a', businessData: { name: 'A' }, tone: 'tone-a', instructions: 'instructions-a' },
+    scope: 'test', testChatId: 'chat-a' };
+  const opening = dashboard.open('instance-a', 'session-a');
+  assert.equal(panels.find(panel => panel.dataset.viewPanel === 'companies')?.hidden, false,
+    'open() navigates to the visible companies view while loading');
+  assert.equal(elements.get('#editor')?.hidden, true, 'the old workspace remains hidden during loading');
+  assert.equal(dashboard.state().channelLoadPending, true);
+  pending.get('session-a')!(response);
+  assert.equal(await opening, true, 'the request started by open() must remain current after its own navigation');
+  assert.equal(dashboard.state().selected?.instance, 'instance-a');
+  assert.equal(dashboard.state().selected?.session, 'session-a');
+  assert.equal(elements.get('#editor')?.hidden, false);
+  assert.equal(elements.get('#model')?.value, 'model-a');
+  assert.equal(elements.get('#tone')?.value, 'tone-a');
+
+  const staleOpening = dashboard.open('instance-b', 'session-b');
+  dashboard.navigateToView('attention');
+  pending.get('session-b')!(response);
+  assert.equal(await staleOpening, false, 'manual navigation still invalidates a pending open');
+  assert.equal(panels.find(panel => panel.dataset.viewPanel === 'attention')?.hidden, false);
+  assert.equal(elements.get('#editor')?.hidden, true, 'a stale response cannot reopen the old workspace');
+  assert.equal(dashboard.state().selected, null);
+});
+
 test('dashboard navigation exposes one requested view and marks its link as current', () => {
   const { showView, panels, navigation } = loadShowView();
   for (const selected of views) {
