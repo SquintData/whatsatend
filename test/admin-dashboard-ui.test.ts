@@ -56,23 +56,65 @@ function fakeDocument(): FakeDocument {
     replaceChildren(...children) { this.children = children; } }) };
 }
 
-test('channel selection ignores stale configuration responses when operators switch channels quickly', async () => {
-  const start = adminPage.indexOf('function createChannelSelectionGuard()');
+test('attention navigation selects conversations before loading and reveals the resulting detail', async () => {
+  const start = adminPage.indexOf('function openAttentionConversation(');
+  const end = adminPage.indexOf('\nfunction ', start + 1);
+  assert.ok(start >= 0 && end > start, 'attention navigation helper must route before loading detail');
+  const openAttentionConversation = runInNewContext('(()=>{' + adminPage.slice(start, end) + ';return openAttentionConversation})()') as
+    (item: unknown, navigate: (view: string) => void, load: (item: unknown) => Promise<void>) => Promise<void>;
+  const state = { view: 'attention', detailVisible: false };
+  await openAttentionConversation({ id: 'conversation-a' }, view => { state.view = view; }, async () => {
+    assert.equal(state.view, 'conversations');
+    await Promise.resolve();
+    state.detailVisible = true;
+  });
+  assert.equal(state.view, 'conversations');
+  assert.equal(state.detailVisible, true);
+});
+
+test('channel workspace loading prevents mapping mismatch and ignores stale responses after navigation', async () => {
+  const start = adminPage.indexOf('function createChannelWorkspaceLoader()');
   const end = adminPage.indexOf('\nfunction showView(view)', start + 1);
-  assert.ok(start >= 0 && end > start, 'dashboard must guard selected-channel requests');
-  const guardSource = '(()=>{' + adminPage.slice(start, end) + ';return createChannelSelectionGuard()})()';
-  const guard = runInNewContext(guardSource, {}) as {
-    begin(key: string): { generation: number; key: string };
-    isCurrent(request: { generation: number; key: string }): boolean;
+  assert.ok(start >= 0 && end > start, 'workspace loader must guard asynchronous channel selection');
+  const createLoader = runInNewContext('(()=>{' + adminPage.slice(start, end) + ';return createChannelWorkspaceLoader})()') as () => {
+    invalidate(): void;
+    load(instance: string, session: string, fetchChannel: (instance: string, session: string) => Promise<{ company: string; tone: string }>,
+      onLoading: () => void, onLoaded: (instance: string, session: string, value: { company: string; tone: string }) => void,
+      onError: () => void): Promise<boolean>;
   };
-  let resolveFirst!: (value: string) => void;
-  const firstResponse = new Promise<string>(resolve => { resolveFirst = resolve; });
-  const first = guard.begin('instance-a\u0000session-a');
-  const second = guard.begin('instance-b\u0000session-b');
-  assert.equal(guard.isCurrent(second), true);
-  assert.equal(guard.isCurrent(first), false);
-  resolveFirst('channel-a');
-  assert.equal(await firstResponse, 'channel-a');
+  const loader = createLoader();
+  const pending = new Map<string, (value: { company: string; tone: string }) => void>();
+  let selected: { instance: string; session: string } | null = null;
+  let form: { company: string; tone: string } | null = null;
+  let workspaceVisible = true;
+  let currentView = 'companies';
+  const load = (instance: string, session: string) => loader.load(instance, session,
+    (i, s) => new Promise(resolve => pending.set(i, resolve)),
+    () => { selected = null; form = null; workspaceVisible = false; },
+    (i, s, value) => { selected = { instance: i, session: s }; form = value; workspaceVisible = true; },
+    () => assert.fail('unexpected channel load failure'));
+
+  const requestA = load('instance-a', 'session-a');
+  assert.equal(workspaceVisible, false, 'old editable fields must disappear while a different channel loads');
+  const requestB = load('instance-b', 'session-b');
+  pending.get('instance-b')!({ company: 'Company B', tone: 'tone-b' });
+  assert.equal(await requestB, true);
+  pending.get('instance-a')!({ company: 'Company A', tone: 'tone-a' });
+  assert.equal(await requestA, false);
+  assert.deepEqual(selected, { instance: 'instance-b', session: 'session-b' });
+  assert.deepEqual(form, { company: 'Company B', tone: 'tone-b' });
+  const savePayload = { ...selected!, ...form! };
+  assert.equal(savePayload.instance, 'instance-b');
+  assert.equal(savePayload.tone, 'tone-b', 'a delayed A response cannot be saved under B mapping');
+
+  const requestC = load('instance-c', 'session-c');
+  currentView = 'attention';
+  loader.invalidate();
+  pending.get('instance-c')!({ company: 'Company C', tone: 'tone-c' });
+  assert.equal(await requestC, false, 'navigation must invalidate an outstanding channel request');
+  assert.equal(workspaceVisible, false);
+  assert.equal(currentView, 'attention', 'an obsolete response cannot reopen the workspace after navigation');
+  assert.equal(selected, null, 'a cancelled loading state has no save mapping');
 });
 
 test('dashboard navigation exposes one requested view and marks its link as current', () => {
