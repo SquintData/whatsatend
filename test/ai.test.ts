@@ -37,11 +37,11 @@ async function fixture(aiEnabled: boolean[] = [true, true]) {
     automations.push({ enabled: true, instance: `instance-${i}`, session: `session-${i}`, chatId: chatIds[i]!, wahaUrl: 'http://waha.test', apiKey: 'not-a-real-key-'.padEnd(32, 'x') });
   }
   const storeFor = (index: number, provider: AIProvider) => new Store(db, automations[index]!, provider);
-  const addIncoming = async (index: number, id: string, body: string, store: Store) => {
+  const addIncoming = async (index: number, id: string, body: string, store: Store, timestamp = Math.floor(Date.now() / 1000)) => {
     const result = await db.query<{ id: string; organization_id: string; session: string; instance: string }>(
       'SELECT c.id, c.organization_id, c.session, c.instance FROM channels c WHERE id = $1', [channels[index]]);
     assert.ok(result.rows[0]);
-    await store.receive(result.rows[0]!, { id, from: chatIds[index]!, fromMe: false, body, timestamp: Math.floor(Date.now() / 1000) });
+    await store.receive(result.rows[0]!, { id, from: chatIds[index]!, fromMe: false, body, timestamp });
   };
   const senderCalls: Array<{ text: string; session: string; chatId: string }> = [];
   const sender: Sender = { async send(request) { senderCalls.push(request); return { id: `sent-${senderCalls.length}` }; } };
@@ -94,6 +94,99 @@ test('manual pause during generation invalidates the epoch and prevents sending'
     assert.equal(f.senderCalls.length, 0);
     assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.mode, 'human');
     assert.equal((await f.pg.query('SELECT * FROM messages WHERE direction = \'outgoing\'')).rows.length, 0);
+  } finally { await f.close(); }
+});
+
+test('admin conversation resume only replies to the next contact message and never revives cancelled jobs', async () => {
+  const f = await fixture();
+  const generated: string[] = [];
+  const provider: AIProvider = { async generate(context) { generated.push(context.message); return reply('answer to next message'); } };
+  try {
+    const store = f.storeFor(0, provider);
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    const source = (await f.pg.query<{ id: string }>(
+      "SELECT id FROM messages WHERE conversation_id = $1 AND provider_message_id = 'history-0'", [conversationId])).rows[0]!;
+    await f.pg.query(`UPDATE conversations SET mode = 'human', automation_epoch = 4,
+      ai_handoff_reason = 'needs_person', ai_handoff_at = now() WHERE id = $1`, [conversationId]);
+    await f.pg.query(`INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body, state)
+      VALUES ($1,$2,$3,$4,$5,3,'old reply','cancelled')`,
+      [randomUUID(), f.organizations[0], f.channels[0], conversationId, source.id]);
+
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+    assert.equal(f.senderCalls.length, 0, 'resume itself must not call WAHA');
+    assert.equal((await f.pg.query("SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1 AND state = 'pending'", [conversationId])).rows[0]!.count, 0);
+    assert.equal((await f.pg.query<{ state: string }>('SELECT state FROM reply_jobs WHERE conversation_id = $1', [conversationId])).rows[0]!.state, 'cancelled');
+    assert.equal((await f.pg.query<{ ai_handoff_reason: string | null }>(
+      'SELECT ai_handoff_reason FROM conversations WHERE id = $1', [conversationId])).rows[0]!.ai_handoff_reason, null);
+
+    await f.addIncoming(0, 'after-admin-resume', 'only this message should get AI', store, Math.ceil(Date.now() / 1000) + 1);
+    assert.equal(await store.processNext(f.sender), true);
+    assert.deepEqual(generated, ['only this message should get AI']);
+    assert.equal(f.senderCalls.length, 1);
+    assert.equal(f.senderCalls[0]!.text, 'answer to next message');
+    assert.deepEqual((await f.pg.query<{ state: string }>(
+      'SELECT state FROM reply_jobs WHERE conversation_id = $1 ORDER BY created_at', [conversationId])).rows.map(row => row.state), ['cancelled', 'sent']);
+  } finally { await f.close(); }
+});
+
+test('admin resume accepts a new message timestamped in its WAHA second but excludes messages received before resume', async () => {
+  const f = await fixture();
+  const generated: string[] = [];
+  const provider: AIProvider = { async generate(context) { generated.push(context.message); return reply('reply to new event'); } };
+  try {
+    const store = f.storeFor(0, provider);
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    await f.pg.query("UPDATE conversations SET mode = 'human' WHERE id = $1", [conversationId]);
+
+    await f.addIncoming(0, 'before-resume', 'already received before resume', store);
+    assert.equal((await f.pg.query('SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1', [conversationId])).rows[0]!.count, 0);
+
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+    const resumed = (await f.pg.query<{ automation_started_at: Date; click_second: number }>(
+      `SELECT automation_started_at, floor(extract(epoch FROM automation_started_at))::int AS click_second
+       FROM conversations WHERE id = $1`, [conversationId])).rows[0]!;
+    assert.ok(new Date(resumed.automation_started_at).getMilliseconds() > 0,
+      'resume boundary must retain subsecond precision instead of rounding up');
+    const clickSecond = resumed.click_second;
+
+    await f.addIncoming(0, 'same-second-after-resume', 'new message in resume second', store, clickSecond);
+    assert.equal((await f.pg.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM reply_jobs j JOIN messages m ON m.id = j.source_message_id
+       WHERE j.conversation_id = $1 AND m.provider_message_id = 'before-resume'`, [conversationId])).rows[0]!.count, 0,
+      'a message received before resume must never acquire a job');
+    assert.equal((await f.pg.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1 AND state = 'pending'", [conversationId])).rows[0]!.count, 1);
+    assert.equal(await store.processNext(f.sender), true);
+    assert.deepEqual(generated, ['new message in resume second']);
+    assert.equal(f.senderCalls[0]!.text, 'reply to new event');
+  } finally { await f.close(); }
+});
+
+test('admin resume samples the transition clock only after channel and conversation locks', async () => {
+  const f = await fixture();
+  const statements: string[] = [];
+  const db: Database = {
+    query: f.db.query,
+    transaction: fn => f.pg.transaction(tx => fn({ query: async <T>(sql: string, values?: unknown[]) => {
+      statements.push(sql);
+      return tx.query<T>(sql, values);
+    } })),
+  };
+  try {
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    await f.pg.query("UPDATE conversations SET mode = 'human' WHERE id = $1", [conversationId]);
+    const store = new Store(db, f.automations[0]!);
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+
+    const channelLock = statements.findIndex(sql => sql.includes('FROM channels ch JOIN organizations o') && sql.includes('FOR UPDATE OF ch, o'));
+    const conversationLock = statements.findIndex(sql => sql.includes('FROM conversations WHERE id = $1') && sql.includes('FOR UPDATE'));
+    const clockSample = statements.findIndex(sql => sql.includes('clock_timestamp()'));
+    const transition = statements.findIndex(sql => sql.includes("UPDATE conversations SET mode = 'auto'"));
+    assert.ok(channelLock >= 0 && conversationLock > channelLock && clockSample > conversationLock && transition > clockSample,
+      'transition time must be sampled after both lock queries and before persisting resume');
   } finally { await f.close(); }
 });
 

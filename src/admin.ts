@@ -16,7 +16,7 @@ export const adminPage = `<!doctype html><html lang="pt-BR"><meta charset="utf-8
 <main id="app"></main><script>
 function createQrView(image,objectUrls=URL){let selectedKey='',generation=0,status='';const clear=()=>{image.hidden=true;const previous=image.dataset.url;if(previous){objectUrls.revokeObjectURL(previous);delete image.dataset.url}image.removeAttribute('src')};return{select(key){if(key===selectedKey)return;selectedKey=key;status='';generation++;clear()},updateStatus(key,next){if(key!==selectedKey)return false;status=next;if(next!=='SCAN_QR_CODE'){generation++;clear()}return true},async show(key,load){if(key!==selectedKey||status!=='SCAN_QR_CODE')return false;const current=++generation;clear();const blob=await load();if(key!==selectedKey||current!==generation||status!=='SCAN_QR_CODE')return false;const url=objectUrls.createObjectURL(blob);image.dataset.url=url;image.src=url;image.hidden=false;return true}}}
 const root=document.querySelector('#app');
-async function api(url,options={}){const method=(options.method||'GET').toUpperCase();const mutating=['POST','PUT','PATCH','DELETE'].includes(method);const response=await fetch(url,{...options,headers:{...(options.body?{'content-type':'application/json'}:{}),...options.headers,...(mutating?{'x-admin-action':'1'}:{})}});if(!response.ok)throw Error(response.status===401?'Sess\u00e3o encerrada. Entre novamente.':response.status===409&&url==='/admin/api/channels'?'channel_already_registered':'Opera\u00e7\u00e3o n\u00e3o conclu\u00edda. Confira os dados e tente outra vez.');return response.status===204?null:response.json()}
+async function api(url,options={}){const method=(options.method||'GET').toUpperCase();const mutating=['POST','PUT','PATCH','DELETE'].includes(method);const response=await fetch(url,{...options,headers:{...(options.body?{'content-type':'application/json'}:{}),...options.headers,...(mutating?{'x-admin-action':'1'}:{})}});if(!response.ok)throw Error(response.status===401?'Sess\u00e3o encerrada. Entre novamente.':response.status===409&&url==='/admin/api/channels'?'channel_already_registered':response.status===409&&url==='/admin/api/conversation/resume'?'Retomada recusada: confira IA/escopo ativos e se n\u00e3o h\u00e1 envio manual em andamento.':'Opera\u00e7\u00e3o n\u00e3o conclu\u00edda. Confira os dados e tente outra vez.');return response.status===204?null:response.json()}
 function createConversationSearchGuard(){let generation=0,key="";return{begin(nextKey){key=nextKey;return{generation:++generation,key}},isCurrent(request){return request.generation===generation&&request.key===key}}}
 function renderReplyAttentionItems(items,target,openConversation,documentRef=document){
   target.replaceChildren();
@@ -37,7 +37,7 @@ function renderReplyAttentionItems(items,target,openConversation,documentRef=doc
 function mountConversationHistory(){
   if(document.querySelector('#conversation-history'))return;
   const panel=document.createElement('section');panel.id='conversation-history';panel.className='panel';
-  panel.innerHTML='<h2>Conversas e hist\u00f3rico</h2><form id="conversation-search" class="row"><label>Inst\u00e2ncia<input name="instance" required maxlength="100"></label><label>Sess\u00e3o<input name="session" required maxlength="200"></label><button class="primary">Buscar conversas</button></form><p class="muted">Exibe at\u00e9 25 conversas por p\u00e1gina e at\u00e9 100 mensagens ao abrir uma conversa. O hist\u00f3rico \u00e9 limitado ao canal selecionado.</p><div id="conversation-list"></div><button id="conversation-next" type="button" hidden>Pr\u00f3xima p\u00e1gina</button><section id="conversation-detail" hidden><h3 id="conversation-title"></h3><div id="conversation-messages"></div><p class="muted">Assumir pausa novas respostas autom\u00e1ticas. Envios WAHA j\u00e1 iniciados n\u00e3o podem ser recolhidos.</p><button id="conversation-pause" type="button">Assumir / pausar automa\u00e7\u00e3o</button><form id="manual-reply-form"><label>Resposta manual<textarea name="text" maxlength="16000" required></textarea></label><button id="manual-reply-button" class="primary">Enviar resposta manual</button></form><p id="manual-reply-status" role="status"></p></section>';
+  panel.innerHTML='<h2>Conversas e hist\u00f3rico</h2><form id="conversation-search" class="row"><label>Inst\u00e2ncia<input name="instance" required maxlength="100"></label><label>Sess\u00e3o<input name="session" required maxlength="200"></label><button class="primary">Buscar conversas</button></form><p class="muted">Exibe at\u00e9 25 conversas por p\u00e1gina e at\u00e9 100 mensagens ao abrir uma conversa. O hist\u00f3rico \u00e9 limitado ao canal selecionado.</p><div id="conversation-list"></div><button id="conversation-next" type="button" hidden>Pr\u00f3xima p\u00e1gina</button><section id="conversation-detail" hidden><h3 id="conversation-title"></h3><div id="conversation-messages"></div><p class="muted">Assumir pausa novas respostas autom\u00e1ticas. Retomar IA limpa handoff e s\u00f3 gera resposta ap\u00f3s a pr\u00f3xima mensagem do contato. Envios WAHA j\u00e1 iniciados n\u00e3o podem ser recolhidos.</p><button id="conversation-pause" type="button">Assumir / pausar automa\u00e7\u00e3o</button> <button id="conversation-resume" type="button">Retomar IA</button><form id="manual-reply-form"><label>Resposta manual<textarea name="text" maxlength="16000" required></textarea></label><button id="manual-reply-button" class="primary">Enviar resposta manual</button></form><p id="manual-reply-status" role="status"></p></section>';
   root.append(panel);let selection=null,nextOffset=null,activeDetail=null;
   const searchGuard=createConversationSearchGuard(),detailGuard=createConversationSearchGuard();
   const list=document.querySelector('#conversation-list'),next=document.querySelector('#conversation-next'),detailPanel=document.querySelector('#conversation-detail');
@@ -51,6 +51,7 @@ function mountConversationHistory(){
       const messages=document.querySelector('#conversation-messages');messages.replaceChildren();
       for(const message of value.messages){const item=document.createElement('p');item.textContent=(message.direction==='incoming'?'Contato':'Atendimento')+' \u00b7 '+String(message.body);messages.append(item)}
       document.querySelector('#conversation-pause').textContent=value.mode==='human'?'Conversa pausada':'Assumir / pausar automa\u00e7\u00e3o';
+      document.querySelector('#conversation-resume').disabled=value.mode!=='human';
       document.querySelector('#manual-reply-status').textContent='';detailPanel.hidden=false;
     }catch{if(!detailGuard.isCurrent(request))return;document.querySelector('#conversation-title').textContent='N\u00e3o foi poss\u00edvel abrir este hist\u00f3rico.';detailPanel.hidden=false}
   };
@@ -72,6 +73,12 @@ function mountConversationHistory(){
     try{await api('/admin/api/conversation/pause',{method:'POST',body:JSON.stringify(current.chosen)});if(activeDetail===current)await showDetail(current.chosen.id)}
     catch{if(activeDetail===current)document.querySelector('#manual-reply-status').textContent='N\u00e3o foi poss\u00edvel pausar esta conversa.'}
     finally{button.disabled=false}
+  };
+  document.querySelector('#conversation-resume').onclick=async()=>{
+    const current=activeDetail;if(!current)return;const button=document.querySelector('#conversation-resume'),status=document.querySelector('#manual-reply-status');button.disabled=true;
+    try{await api('/admin/api/conversation/resume',{method:'POST',body:JSON.stringify(current.chosen)});if(activeDetail===current){await showDetail(current.chosen.id);if(activeDetail?.chosen.id===current.chosen.id){status.textContent='IA retomada. A pr\u00f3xima resposta depende de uma nova mensagem do contato.';document.querySelector('#attention-refresh')?.click()}}}
+    catch{if(activeDetail===current)status.textContent='Retomada n\u00e3o conclu\u00edda. Verifique o escopo, a ativa\u00e7\u00e3o da IA e se h\u00e1 envio manual em andamento.'}
+    finally{if(activeDetail===current)button.disabled=false}
   };
   document.querySelector('#manual-reply-form').onsubmit=async event=>{
     event.preventDefault();const current=activeDetail;if(!current)return;const form=event.currentTarget,text=form.elements.text.value;
@@ -305,6 +312,19 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
       const target = await store.pauseConversation(parsed.data.instance, parsed.data.session, parsed.data.id);
       if (!target) return reject(reply, 404);
       return { mode: 'human' };
+    } catch { return reject(reply, 503); }
+  });
+  app.post('/admin/api/conversation/resume', async (request, reply) => {
+    headers(reply); if (!guard(request, reply)) return;
+    if (!ensureMutation(request)) return reject(reply, 400);
+    const parsed = conversationMutationSchema.safeParse(request.body);
+    if (!parsed.success || !store) return reject(reply, parsed.success ? 503 : 400);
+    try {
+      const result = await store.resumeConversation(parsed.data.instance, parsed.data.session, parsed.data.id);
+      if (result.status === 'resumed') return { mode: 'auto' };
+      if (result.status === 'not_found') return reject(reply, 404);
+      if (result.status === 'manual_send_in_progress') return reply.code(409).send({ error: 'manual_send_in_progress' });
+      return reply.code(409).send({ error: 'conversation_not_resumable' });
     } catch { return reject(reply, 503); }
   });
   app.post('/admin/api/conversation/reply', async (request, reply) => {

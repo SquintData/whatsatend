@@ -20,6 +20,7 @@ export type ManualSendReservation =
   | { status: 'reserved'; target: ManualConversationTarget }
   | { status: 'in_flight' }
   | { status: 'not_found' };
+export type ConversationResumeStatus = 'resumed' | 'not_found' | 'not_eligible' | 'invalid_state' | 'manual_send_in_progress' | 'automation_disabled';
 
 export class Store {
   constructor(private db: Database, private automation: Automation = disabledAutomation, private aiProvider?: AIProvider) {}
@@ -105,7 +106,11 @@ export class Store {
         await tx.query(
           `INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body)
            SELECT $1, cv.organization_id, cv.channel_id, cv.id, $2, cv.automation_epoch, $3
-           FROM conversations cv WHERE cv.id = $4 AND cv.mode = 'auto'
+           FROM conversations cv JOIN messages m ON m.id = $2
+             AND m.organization_id = cv.organization_id AND m.channel_id = cv.channel_id
+             AND m.conversation_id = cv.id
+           WHERE cv.id = $4 AND cv.mode = 'auto'
+             AND m.received_at >= cv.automation_started_at
              AND $5 >= floor(extract(epoch FROM cv.automation_started_at))
              AND $5 >= extract(epoch FROM now()) - 120 AND $5 <= extract(epoch FROM now()) + 30
              AND NOT EXISTS (SELECT 1 FROM reply_jobs j WHERE j.conversation_id = cv.id
@@ -143,6 +148,50 @@ export class Store {
       return { organizationId: scopedChannel.organization_id, channelId: scopedChannel.id,
         conversationId, session: scopedChannel.session, chatId: row.chat_id,
         channelActive: scopedChannel.active, organizationActive: scopedChannel.organization_active };
+    });
+  }
+
+  async resumeConversation(instance: string, session: string, conversationId: string): Promise<{ status: ConversationResumeStatus }> {
+    if (!this.automation.enabled) return { status: 'automation_disabled' };
+    return this.db.transaction(async tx => {
+      const channel = await tx.query<{
+        id: string; organization_id: string; active: boolean; organization_active: boolean; ai_enabled: boolean;
+        automation_scope: 'disabled' | 'test' | 'all'; automation_test_chat_id: string | null;
+        automation_activated_at: Date | null;
+      }>(`SELECT ch.id, ch.organization_id, ch.active, o.active AS organization_active, o.ai_enabled,
+          ch.automation_scope, ch.automation_test_chat_id, ch.automation_activated_at
+        FROM channels ch JOIN organizations o ON o.id = ch.organization_id
+        WHERE ch.instance = $1 AND ch.session = $2 FOR UPDATE OF ch, o`, [instance, session]);
+      const scope = channel.rows[0];
+      if (!scope) return { status: 'not_found' };
+      if (!scope.active || !scope.organization_active || !scope.ai_enabled || scope.automation_scope === 'disabled'
+        || !scope.automation_activated_at) return { status: 'not_eligible' };
+
+      const conversation = await tx.query<{
+        id: string; chat_id: string; mode: string; manual_send_in_flight: boolean;
+      }>(`SELECT id, chat_id, mode, manual_send_started_at > now() - interval '1 minute' AS manual_send_in_flight
+        FROM conversations WHERE id = $1 AND organization_id = $2 AND channel_id = $3 FOR UPDATE`,
+        [conversationId, scope.organization_id, scope.id]);
+      const row = conversation.rows[0];
+      if (!row) return { status: 'not_found' };
+      if (!directChat(row.chat_id) || !channelChatAllowed(scope.automation_scope, scope.automation_test_chat_id, row.chat_id)) {
+        return { status: 'not_eligible' };
+      }
+      if (row.manual_send_in_flight) return { status: 'manual_send_in_progress' };
+      if (row.mode !== 'human') return { status: 'invalid_state' };
+
+      const transition = await tx.query<{ transition_at: string }>(
+        'SELECT clock_timestamp()::text AS transition_at');
+      await tx.query(`UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
+          ai_handoff_reason = NULL, ai_handoff_at = NULL,
+          automation_started_at = GREATEST($5::timestamptz, $4),
+          control_timestamp = GREATEST(control_timestamp, ceil(extract(epoch FROM $5::timestamptz))::bigint)
+        WHERE id = $1 AND organization_id = $2 AND channel_id = $3 AND mode = 'human'`,
+        [conversationId, scope.organization_id, scope.id, scope.automation_activated_at, transition.rows[0]!.transition_at]);
+      await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
+        WHERE organization_id = $1 AND channel_id = $2 AND conversation_id = $3 AND state = 'pending'`,
+        [scope.organization_id, scope.id, conversationId]);
+      return { status: 'resumed' };
     });
   }
 
@@ -247,7 +296,7 @@ export class Store {
       const resumed = await tx.query(
         `UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
          ai_handoff_reason = NULL, ai_handoff_at = NULL,
-         automation_started_at = GREATEST(now(), to_timestamp($2 + 1)), control_timestamp = $2
+         automation_started_at = now(), control_timestamp = $2
          WHERE id = $1 AND mode IN ('human','monitoring') AND $2 > control_timestamp
          AND $2 >= extract(epoch FROM now()) - 120 AND $2 <= extract(epoch FROM now()) + 30
          RETURNING id`, [id, reaction.timestamp]);
@@ -326,6 +375,7 @@ export class Store {
            AND ((c.automation_scope = 'all' AND cv.chat_id ~ '^[0-9]+(@c[.]us|@s[.]whatsapp[.]net|@lid)$')
              OR (c.automation_scope = 'test' AND cv.chat_id = c.automation_test_chat_id))
            AND c.automation_activated_at IS NOT NULL
+           AND m.received_at >= cv.automation_started_at
            AND m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
            AND m.provider_timestamp >= ceil(extract(epoch FROM c.automation_activated_at))
            AND m.provider_timestamp >= extract(epoch FROM now()) - 120
@@ -424,7 +474,8 @@ export class Store {
       );
       const jobs = await tx.query<{ state: string; epoch: number; body: string; fresh: boolean }>(
         `SELECT j.state, j.epoch, j.body,
-          (m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
+          (m.received_at >= cv.automation_started_at
+            AND m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
             AND c.automation_activated_at IS NOT NULL
             AND m.provider_timestamp >= ceil(extract(epoch FROM c.automation_activated_at))
             AND m.provider_timestamp >= extract(epoch FROM now()) - 120
