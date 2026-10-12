@@ -462,7 +462,7 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /name="businessInfo"[^>]*maxlength="10000"/);
   assert.match(adminPage, /name="tone"[^>]*maxlength="300"/);
   assert.match(adminPage, /name="instructions"[^>]*maxlength="2000"/);
-  assert.match(adminPage, /Informações da empresa para a IA/);
+  assert.match(adminPage, /Informa(?:ções|&ccedil;&otilde;es) da empresa para a IA/);
   assert.match(adminPage, /Sessão já cadastrada neste canal ou existente no WAHA/);
   assert.match(adminPage, /Conexão/);
   assert.match(adminPage, /Exibir QR de pareamento/);
