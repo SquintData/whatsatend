@@ -10,6 +10,11 @@ import { createCompany, parseCompanyOnboarding } from '../src/company-admin.js';
 import { Store, tokenHash } from '../src/store.js';
 import { adminPage } from '../src/admin.js';
 import { WahaAdminClient } from '../src/waha-admin.js';
+import { disabledAutomation, type Automation } from '../src/automation.js';
+
+const enabledAutomation: Automation = {
+  enabled: true, instance: '', session: '', chatId: '', wahaUrl: 'http://waha.local', apiKey: 'test-key-'.padEnd(40, 'x'),
+};
 
 function frontendApi(fetcher: (url: string, options: { method?: string; headers: Record<string, string>; body?: string }) => unknown) {
   const start = adminPage.indexOf('async function api');
@@ -19,7 +24,7 @@ function frontendApi(fetcher: (url: string, options: { method?: string; headers:
     (url: string, options?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<unknown>;
 }
 
-async function fixture(withAdmin = true) {
+async function fixture(withAdmin = true, automation: Automation = disabledAutomation) {
   const pg = new PGlite();
   let queryCount = 0;
   let beforeManualSend: (() => Promise<void>) | undefined;
@@ -55,7 +60,7 @@ async function fixture(withAdmin = true) {
     if (url.includes('/api/sessions/')) return Response.json({ status: url.includes('qr-channel') ? 'SCAN_QR_CODE' : 'WORKING', engine: 'GOWS', me: { id: '5511999999999@c.us' } });
     return new Response(null, { status: 500 });
   });
-  const app = buildApp(new Store(db), false, withAdmin ? { db, secret: 'admin-secret-'.padEnd(40, 'x'), waha,
+  const app = buildApp(new Store(db, automation), false, withAdmin ? { db, secret: 'admin-secret-'.padEnd(40, 'x'), waha,
     publicBaseUrl: 'https://app.local' } : undefined);
   return { pg, db, app, wahaCalls, queryCount: () => queryCount, resetQueryCount: () => { queryCount = 0; },
     setBeforeManualSend: (handler: () => Promise<void>) => { beforeManualSend = handler; },
@@ -290,6 +295,164 @@ test('manual send uncertainty leaves the conversation paused and does not create
   } finally { await f.close(); }
 });
 
+test('admin resume authenticates, scopes to the selected channel, clears handoff and leaves cancelled jobs untouched', async () => {
+  const f = await fixture(true, enabledAutomation);
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Retomar A', instance: 'principal', session: 'resume-a', webhookToken: 'a'.repeat(64) })));
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Retomar B', instance: 'principal', session: 'resume-b', webhookToken: 'b'.repeat(64) })));
+    const channels = (await f.pg.query<{ id: string; organization_id: string; session: string }>(
+      'SELECT id, organization_id, session FROM channels ORDER BY session')).rows;
+    await f.pg.query('UPDATE organizations SET ai_enabled = true');
+    await f.pg.query(`UPDATE channels SET automation_scope = 'all', automation_activated_at = now() - interval '10 seconds'`);
+    const conversationA = randomUUID(), conversationB = randomUUID(), messageId = randomUUID(), jobId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id, mode, automation_epoch,
+      ai_handoff_reason, ai_handoff_at)
+      VALUES ($1,$2,$3,'5511999999991@c.us','human',4,'needs_person',now()),
+             ($4,$5,$6,'5511999999991@c.us','human',8,'sensitive_request',now())`,
+      [conversationA, channels[0]!.organization_id, channels[0]!.id,
+        conversationB, channels[1]!.organization_id, channels[1]!.id]);
+    await f.pg.query(`INSERT INTO messages(id, organization_id, channel_id, conversation_id, provider_message_id, direction, body)
+      VALUES ($1,$2,$3,$4,'old-resume-message','incoming','No output expected')`,
+      [messageId, channels[0]!.organization_id, channels[0]!.id, conversationA]);
+    await f.pg.query(`INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body, state)
+      VALUES ($1,$2,$3,$4,$5,4,'cancelled old reply','cancelled')`,
+      [jobId, channels[0]!.organization_id, channels[0]!.id, conversationA, messageId]);
+
+    f.resetQueryCount();
+    const unauthorized = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume',
+      headers: { host: 'admin.test', origin: 'https://admin.test', 'x-admin-action': '1' },
+      payload: { instance: 'principal', session: 'resume-a', id: conversationA } });
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(f.queryCount(), 0, 'unauthenticated resume must not query conversation data');
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+
+    const crossChannel = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume', headers,
+      payload: { instance: 'principal', session: 'resume-b', id: conversationA } });
+    assert.equal(crossChannel.statusCode, 404);
+    const resumed = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume', headers,
+      payload: { instance: 'principal', session: 'resume-a', id: conversationA } });
+    assert.equal(resumed.statusCode, 200);
+    assert.deepEqual(resumed.json(), { mode: 'auto' });
+    assert.equal(f.wahaCalls.length, 0, 'resume arms automation without sending a response');
+
+    const rows = await f.pg.query<{ id: string; mode: string; automation_epoch: number; ai_handoff_reason: string | null }>(
+      `SELECT id, mode, automation_epoch, ai_handoff_reason FROM conversations ORDER BY id`);
+    const resumedConversation = rows.rows.find(row => row.id === conversationA)!;
+    const untouchedConversation = rows.rows.find(row => row.id === conversationB)!;
+    assert.deepEqual(resumedConversation, { id: conversationA, mode: 'auto', automation_epoch: 5, ai_handoff_reason: null });
+    assert.deepEqual(untouchedConversation, { id: conversationB, mode: 'human', automation_epoch: 8, ai_handoff_reason: 'sensitive_request' });
+    assert.equal((await f.pg.query<{ state: string }>('SELECT state FROM reply_jobs WHERE id = $1', [jobId])).rows[0]!.state,
+      'cancelled', 'a cancelled job remains cancelled after resumption');
+    assert.equal((await f.pg.query('SELECT * FROM reply_jobs WHERE conversation_id = $1 AND state = \'pending\'', [conversationA])).rows.length, 0);
+  } finally { await f.close(); }
+});
+
+test('admin resume rejects inactive or ineligible channels, non-AI companies and non-human states', async () => {
+  const f = await fixture(true, enabledAutomation);
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Retomar', instance: 'principal', session: 'resume', webhookToken: 'a'.repeat(64) })));
+    const channel = (await f.pg.query<{ id: string; organization_id: string }>('SELECT id, organization_id FROM channels')).rows[0]!;
+    const conversationId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id, mode)
+      VALUES ($1,$2,$3,'5511999999999@c.us','human')`, [conversationId, channel.organization_id, channel.id]);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+    const payload = { instance: 'principal', session: 'resume', id: conversationId };
+    const resume = async () => f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume', headers, payload });
+
+    await f.pg.query('UPDATE channels SET active = false WHERE id = $1', [channel.id]);
+    assert.equal((await resume()).statusCode, 409, 'inactive channel cannot resume');
+    await f.pg.query("UPDATE channels SET active = true, automation_scope = 'all', automation_activated_at = now() WHERE id = $1", [channel.id]);
+    await f.pg.query('UPDATE organizations SET active = false WHERE id = $1', [channel.organization_id]);
+    assert.equal((await resume()).statusCode, 409, 'inactive organization cannot resume');
+    await f.pg.query('UPDATE organizations SET active = true WHERE id = $1', [channel.organization_id]);
+    assert.equal((await resume()).statusCode, 409, 'company AI opt-in is required for Retomar IA');
+    await f.pg.query('UPDATE organizations SET ai_enabled = true WHERE id = $1', [channel.organization_id]);
+    await f.pg.query("UPDATE channels SET automation_scope = 'disabled', automation_activated_at = NULL WHERE id = $1", [channel.id]);
+    assert.equal((await resume()).statusCode, 409, 'disabled channel scope cannot resume');
+    await f.pg.query("UPDATE channels SET automation_scope = 'test', automation_test_chat_id = '5511000000000@c.us', automation_activated_at = now() WHERE id = $1", [channel.id]);
+    assert.equal((await resume()).statusCode, 409, 'test scope for another contact cannot resume');
+    await f.pg.query("UPDATE channels SET automation_test_chat_id = '5511999999999@c.us' WHERE id = $1", [channel.id]);
+    assert.equal((await resume()).statusCode, 200, 'matching test scope may resume the selected contact');
+    await f.pg.query("UPDATE conversations SET mode = 'human' WHERE id = $1", [conversationId]);
+    await f.pg.query("UPDATE channels SET automation_scope = 'all', automation_test_chat_id = NULL, automation_activated_at = now() WHERE id = $1", [channel.id]);
+    await f.pg.query("UPDATE conversations SET mode = 'auto' WHERE id = $1", [conversationId]);
+    assert.equal((await resume()).statusCode, 409, 'already automatic conversation cannot resume twice');
+    await f.pg.query("UPDATE conversations SET mode = 'monitoring' WHERE id = $1", [conversationId]);
+    assert.equal((await resume()).statusCode, 409, 'monitoring conversation cannot be resumed as paused human work');
+    assert.equal((await f.pg.query('SELECT automation_epoch FROM conversations WHERE id = $1', [conversationId])).rows[0]!.automation_epoch, 1);
+    assert.equal(f.wahaCalls.length, 0);
+  } finally { await f.close(); }
+});
+
+test('admin resume respects the global automation kill switch', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Kill switch', instance: 'principal', session: 'resume-off', webhookToken: 'a'.repeat(64) })));
+    const channel = (await f.pg.query<{ id: string; organization_id: string }>('SELECT id, organization_id FROM channels')).rows[0]!;
+    await f.pg.query('UPDATE organizations SET ai_enabled = true WHERE id = $1', [channel.organization_id]);
+    await f.pg.query("UPDATE channels SET automation_scope = 'all', automation_activated_at = now() WHERE id = $1", [channel.id]);
+    const conversationId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id, mode)
+      VALUES ($1,$2,$3,'5511999999999@c.us','human')`, [conversationId, channel.organization_id, channel.id]);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+    const response = await f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume', headers,
+      payload: { instance: 'principal', session: 'resume-off', id: conversationId } });
+    assert.equal(response.statusCode, 409);
+    assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE id = $1', [conversationId])).rows[0]!.mode, 'human');
+  } finally { await f.close(); }
+});
+
+test('admin resume cannot race an in-flight manual send and can be retried after it completes', async () => {
+  const f = await fixture(true, enabledAutomation);
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({ name: 'Retomar corrida', instance: 'principal', session: 'resume-race', webhookToken: 'a'.repeat(64) })));
+    const channel = (await f.pg.query<{ id: string; organization_id: string }>('SELECT id, organization_id FROM channels')).rows[0]!;
+    await f.pg.query('UPDATE organizations SET ai_enabled = true WHERE id = $1', [channel.organization_id]);
+    await f.pg.query("UPDATE channels SET automation_scope = 'all', automation_activated_at = now() WHERE id = $1", [channel.id]);
+    const conversationId = randomUUID();
+    await f.pg.query(`INSERT INTO conversations(id, organization_id, channel_id, chat_id, mode, ai_handoff_reason, ai_handoff_at)
+      VALUES ($1,$2,$3,'5511999999999@c.us','human','needs_person',now())`, [conversationId, channel.organization_id, channel.id]);
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: {
+      host: 'admin.test', origin: 'https://admin.test',
+    }, payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    const headers = { cookie: String(login.headers['set-cookie']).split(';')[0]!, host: 'admin.test',
+      origin: 'https://admin.test', 'x-admin-action': '1' };
+    let entered!: () => void;
+    let release!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    f.setBeforeManualSend(async () => { entered(); await barrier; });
+    const manual = f.app.inject({ method: 'POST', url: '/admin/api/conversation/reply', headers,
+      payload: { instance: 'principal', session: 'resume-race', id: conversationId, text: 'Atendimento manual' } });
+    await sending;
+    const resume = () => f.app.inject({ method: 'POST', url: '/admin/api/conversation/resume', headers,
+      payload: { instance: 'principal', session: 'resume-race', id: conversationId } });
+    const blocked = await resume();
+    assert.equal(blocked.statusCode, 409);
+    assert.deepEqual(blocked.json(), { error: 'manual_send_in_progress' });
+    release();
+    assert.equal((await manual).statusCode, 200);
+    const retried = await resume();
+    assert.equal(retried.statusCode, 200, 'operator can explicitly retry after manual send ends');
+    const final = await f.pg.query<{ mode: string; ai_handoff_reason: string | null; manual_send_started_at: Date | null }>(
+      'SELECT mode, ai_handoff_reason, manual_send_started_at FROM conversations WHERE id = $1', [conversationId]);
+    assert.deepEqual(final.rows[0], { mode: 'auto', ai_handoff_reason: null, manual_send_started_at: null });
+    assert.equal(f.wahaCalls.filter(call => call.url.endsWith('/api/sendText')).length, 1);
+  } finally { await f.close(); }
+});
+
 test('admin panel script remains valid and includes channel connection operations', () => {
   const start = adminPage.indexOf('<script>') + '<script>'.length;
   const end = adminPage.indexOf('</script>', start);
@@ -308,6 +471,10 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /admin\/api\/conversations/);
   assert.match(adminPage, /admin\/api\/conversation\/pause/);
   assert.match(adminPage, /admin\/api\/conversation\/reply/);
+  assert.match(adminPage, /admin\/api\/conversation\/resume/);
+  assert.match(adminPage, /Retomar IA/);
+  assert.match(adminPage, /id="conversation-resume"/);
+  assert.match(adminPage, /s\u00f3 gera resposta ap\u00f3s a pr\u00f3xima mensagem do contato/);
   assert.match(adminPage, /Enviar resposta manual/);
   assert.match(adminPage, /Consumo de IA/);
   assert.match(adminPage, /\/admin\/api\/ai-usage/);

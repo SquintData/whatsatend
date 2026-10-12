@@ -37,11 +37,11 @@ async function fixture(aiEnabled: boolean[] = [true, true]) {
     automations.push({ enabled: true, instance: `instance-${i}`, session: `session-${i}`, chatId: chatIds[i]!, wahaUrl: 'http://waha.test', apiKey: 'not-a-real-key-'.padEnd(32, 'x') });
   }
   const storeFor = (index: number, provider: AIProvider) => new Store(db, automations[index]!, provider);
-  const addIncoming = async (index: number, id: string, body: string, store: Store) => {
+  const addIncoming = async (index: number, id: string, body: string, store: Store, timestamp = Math.floor(Date.now() / 1000)) => {
     const result = await db.query<{ id: string; organization_id: string; session: string; instance: string }>(
       'SELECT c.id, c.organization_id, c.session, c.instance FROM channels c WHERE id = $1', [channels[index]]);
     assert.ok(result.rows[0]);
-    await store.receive(result.rows[0]!, { id, from: chatIds[index]!, fromMe: false, body, timestamp: Math.floor(Date.now() / 1000) });
+    await store.receive(result.rows[0]!, { id, from: chatIds[index]!, fromMe: false, body, timestamp });
   };
   const senderCalls: Array<{ text: string; session: string; chatId: string }> = [];
   const sender: Sender = { async send(request) { senderCalls.push(request); return { id: `sent-${senderCalls.length}` }; } };
@@ -94,6 +94,39 @@ test('manual pause during generation invalidates the epoch and prevents sending'
     assert.equal(f.senderCalls.length, 0);
     assert.equal((await f.pg.query<{ mode: string }>('SELECT mode FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.mode, 'human');
     assert.equal((await f.pg.query('SELECT * FROM messages WHERE direction = \'outgoing\'')).rows.length, 0);
+  } finally { await f.close(); }
+});
+
+test('admin conversation resume only replies to the next contact message and never revives cancelled jobs', async () => {
+  const f = await fixture();
+  const generated: string[] = [];
+  const provider: AIProvider = { async generate(context) { generated.push(context.message); return reply('answer to next message'); } };
+  try {
+    const store = f.storeFor(0, provider);
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    const source = (await f.pg.query<{ id: string }>(
+      "SELECT id FROM messages WHERE conversation_id = $1 AND provider_message_id = 'history-0'", [conversationId])).rows[0]!;
+    await f.pg.query(`UPDATE conversations SET mode = 'human', automation_epoch = 4,
+      ai_handoff_reason = 'needs_person', ai_handoff_at = now() WHERE id = $1`, [conversationId]);
+    await f.pg.query(`INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body, state)
+      VALUES ($1,$2,$3,$4,$5,3,'old reply','cancelled')`,
+      [randomUUID(), f.organizations[0], f.channels[0], conversationId, source.id]);
+
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+    assert.equal(f.senderCalls.length, 0, 'resume itself must not call WAHA');
+    assert.equal((await f.pg.query("SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1 AND state = 'pending'", [conversationId])).rows[0]!.count, 0);
+    assert.equal((await f.pg.query<{ state: string }>('SELECT state FROM reply_jobs WHERE conversation_id = $1', [conversationId])).rows[0]!.state, 'cancelled');
+    assert.equal((await f.pg.query<{ ai_handoff_reason: string | null }>(
+      'SELECT ai_handoff_reason FROM conversations WHERE id = $1', [conversationId])).rows[0]!.ai_handoff_reason, null);
+
+    await f.addIncoming(0, 'after-admin-resume', 'only this message should get AI', store, Math.ceil(Date.now() / 1000) + 1);
+    assert.equal(await store.processNext(f.sender), true);
+    assert.deepEqual(generated, ['only this message should get AI']);
+    assert.equal(f.senderCalls.length, 1);
+    assert.equal(f.senderCalls[0]!.text, 'answer to next message');
+    assert.deepEqual((await f.pg.query<{ state: string }>(
+      'SELECT state FROM reply_jobs WHERE conversation_id = $1 ORDER BY created_at', [conversationId])).rows.map(row => row.state), ['cancelled', 'sent']);
   } finally { await f.close(); }
 });
 

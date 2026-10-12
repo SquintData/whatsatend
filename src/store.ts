@@ -20,6 +20,7 @@ export type ManualSendReservation =
   | { status: 'reserved'; target: ManualConversationTarget }
   | { status: 'in_flight' }
   | { status: 'not_found' };
+export type ConversationResumeStatus = 'resumed' | 'not_found' | 'not_eligible' | 'invalid_state' | 'manual_send_in_progress' | 'automation_disabled';
 
 export class Store {
   constructor(private db: Database, private automation: Automation = disabledAutomation, private aiProvider?: AIProvider) {}
@@ -143,6 +144,48 @@ export class Store {
       return { organizationId: scopedChannel.organization_id, channelId: scopedChannel.id,
         conversationId, session: scopedChannel.session, chatId: row.chat_id,
         channelActive: scopedChannel.active, organizationActive: scopedChannel.organization_active };
+    });
+  }
+
+  async resumeConversation(instance: string, session: string, conversationId: string): Promise<{ status: ConversationResumeStatus }> {
+    if (!this.automation.enabled) return { status: 'automation_disabled' };
+    return this.db.transaction(async tx => {
+      const channel = await tx.query<{
+        id: string; organization_id: string; active: boolean; organization_active: boolean; ai_enabled: boolean;
+        automation_scope: 'disabled' | 'test' | 'all'; automation_test_chat_id: string | null;
+        automation_activated_at: Date | null;
+      }>(`SELECT ch.id, ch.organization_id, ch.active, o.active AS organization_active, o.ai_enabled,
+          ch.automation_scope, ch.automation_test_chat_id, ch.automation_activated_at
+        FROM channels ch JOIN organizations o ON o.id = ch.organization_id
+        WHERE ch.instance = $1 AND ch.session = $2 FOR UPDATE OF ch, o`, [instance, session]);
+      const scope = channel.rows[0];
+      if (!scope) return { status: 'not_found' };
+      if (!scope.active || !scope.organization_active || !scope.ai_enabled || scope.automation_scope === 'disabled'
+        || !scope.automation_activated_at) return { status: 'not_eligible' };
+
+      const conversation = await tx.query<{
+        id: string; chat_id: string; mode: string; manual_send_in_flight: boolean;
+      }>(`SELECT id, chat_id, mode, manual_send_started_at > now() - interval '1 minute' AS manual_send_in_flight
+        FROM conversations WHERE id = $1 AND organization_id = $2 AND channel_id = $3 FOR UPDATE`,
+        [conversationId, scope.organization_id, scope.id]);
+      const row = conversation.rows[0];
+      if (!row) return { status: 'not_found' };
+      if (!directChat(row.chat_id) || !channelChatAllowed(scope.automation_scope, scope.automation_test_chat_id, row.chat_id)) {
+        return { status: 'not_eligible' };
+      }
+      if (row.manual_send_in_flight) return { status: 'manual_send_in_progress' };
+      if (row.mode !== 'human') return { status: 'invalid_state' };
+
+      await tx.query(`UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
+          ai_handoff_reason = NULL, ai_handoff_at = NULL,
+          automation_started_at = GREATEST(to_timestamp(ceil(extract(epoch FROM now()))), $4),
+          control_timestamp = GREATEST(control_timestamp, ceil(extract(epoch FROM now()))::bigint)
+        WHERE id = $1 AND organization_id = $2 AND channel_id = $3 AND mode = 'human'`,
+        [conversationId, scope.organization_id, scope.id, scope.automation_activated_at]);
+      await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
+        WHERE organization_id = $1 AND channel_id = $2 AND conversation_id = $3 AND state = 'pending'`,
+        [scope.organization_id, scope.id, conversationId]);
+      return { status: 'resumed' };
     });
   }
 
