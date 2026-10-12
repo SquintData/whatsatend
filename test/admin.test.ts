@@ -463,8 +463,8 @@ test('admin panel script remains valid and includes channel connection operation
   assert.match(adminPage, /name="tone"[^>]*maxlength="300"/);
   assert.match(adminPage, /name="instructions"[^>]*maxlength="2000"/);
   assert.match(adminPage, /Informa(?:ções|&ccedil;&otilde;es) da empresa para a IA/);
-  assert.match(adminPage, /Sessão já cadastrada neste canal ou existente no WAHA/);
-  assert.match(adminPage, /Conexão/);
+  assert.ok(adminPage.includes('Sess' + String.fromCharCode(227) + 'o j' + String.fromCharCode(225) + ' cadastrada neste canal ou existente no WAHA.'));
+  assert.match(adminPage, /Conex&atilde;o/);
   assert.match(adminPage, /Exibir QR de pareamento/);
   assert.match(adminPage, /Conversas e histórico/);
   assert.match(adminPage, /Abrir histórico/);
