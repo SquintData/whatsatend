@@ -180,12 +180,14 @@ export class Store {
       if (row.manual_send_in_flight) return { status: 'manual_send_in_progress' };
       if (row.mode !== 'human') return { status: 'invalid_state' };
 
+      const transition = await tx.query<{ transition_at: string }>(
+        'SELECT clock_timestamp()::text AS transition_at');
       await tx.query(`UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
           ai_handoff_reason = NULL, ai_handoff_at = NULL,
-          automation_started_at = GREATEST(now(), $4),
-          control_timestamp = GREATEST(control_timestamp, ceil(extract(epoch FROM now()))::bigint)
+          automation_started_at = GREATEST($5::timestamptz, $4),
+          control_timestamp = GREATEST(control_timestamp, ceil(extract(epoch FROM $5::timestamptz))::bigint)
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3 AND mode = 'human'`,
-        [conversationId, scope.organization_id, scope.id, scope.automation_activated_at]);
+        [conversationId, scope.organization_id, scope.id, scope.automation_activated_at, transition.rows[0]!.transition_at]);
       await tx.query(`UPDATE reply_jobs SET state = 'cancelled', completed_at = now()
         WHERE organization_id = $1 AND channel_id = $2 AND conversation_id = $3 AND state = 'pending'`,
         [scope.organization_id, scope.id, conversationId]);

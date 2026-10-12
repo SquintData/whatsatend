@@ -143,14 +143,13 @@ test('admin resume accepts a new message timestamped in its WAHA second but excl
     await f.addIncoming(0, 'before-resume', 'already received before resume', store);
     assert.equal((await f.pg.query('SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1', [conversationId])).rows[0]!.count, 0);
 
-    const clickSecond = Math.floor(Date.now() / 1000);
     assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
     const resumed = (await f.pg.query<{ automation_started_at: Date; click_second: number }>(
       `SELECT automation_started_at, floor(extract(epoch FROM automation_started_at))::int AS click_second
        FROM conversations WHERE id = $1`, [conversationId])).rows[0]!;
     assert.ok(new Date(resumed.automation_started_at).getMilliseconds() > 0,
       'resume boundary must retain subsecond precision instead of rounding up');
-    assert.equal(resumed.click_second, clickSecond, 'resume must begin in the click second');
+    const clickSecond = resumed.click_second;
 
     await f.addIncoming(0, 'same-second-after-resume', 'new message in resume second', store, clickSecond);
     assert.equal((await f.pg.query<{ count: number }>(
@@ -162,6 +161,32 @@ test('admin resume accepts a new message timestamped in its WAHA second but excl
     assert.equal(await store.processNext(f.sender), true);
     assert.deepEqual(generated, ['new message in resume second']);
     assert.equal(f.senderCalls[0]!.text, 'reply to new event');
+  } finally { await f.close(); }
+});
+
+test('admin resume samples the transition clock only after channel and conversation locks', async () => {
+  const f = await fixture();
+  const statements: string[] = [];
+  const db: Database = {
+    query: f.db.query,
+    transaction: fn => f.pg.transaction(tx => fn({ query: async <T>(sql: string, values?: unknown[]) => {
+      statements.push(sql);
+      return tx.query<T>(sql, values);
+    } })),
+  };
+  try {
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    await f.pg.query("UPDATE conversations SET mode = 'human' WHERE id = $1", [conversationId]);
+    const store = new Store(db, f.automations[0]!);
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+
+    const channelLock = statements.findIndex(sql => sql.includes('FROM channels ch JOIN organizations o') && sql.includes('FOR UPDATE OF ch, o'));
+    const conversationLock = statements.findIndex(sql => sql.includes('FROM conversations WHERE id = $1') && sql.includes('FOR UPDATE'));
+    const clockSample = statements.findIndex(sql => sql.includes('clock_timestamp()'));
+    const transition = statements.findIndex(sql => sql.includes("UPDATE conversations SET mode = 'auto'"));
+    assert.ok(channelLock >= 0 && conversationLock > channelLock && clockSample > conversationLock && transition > clockSample,
+      'transition time must be sampled after both lock queries and before persisting resume');
   } finally { await f.close(); }
 });
 
