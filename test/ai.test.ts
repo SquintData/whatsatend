@@ -130,6 +130,41 @@ test('admin conversation resume only replies to the next contact message and nev
   } finally { await f.close(); }
 });
 
+test('admin resume accepts a new message timestamped in its WAHA second but excludes messages received before resume', async () => {
+  const f = await fixture();
+  const generated: string[] = [];
+  const provider: AIProvider = { async generate(context) { generated.push(context.message); return reply('reply to new event'); } };
+  try {
+    const store = f.storeFor(0, provider);
+    const conversationId = (await f.pg.query<{ id: string }>(
+      'SELECT id FROM conversations WHERE channel_id = $1', [f.channels[0]])).rows[0]!.id;
+    await f.pg.query("UPDATE conversations SET mode = 'human' WHERE id = $1", [conversationId]);
+
+    await f.addIncoming(0, 'before-resume', 'already received before resume', store);
+    assert.equal((await f.pg.query('SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1', [conversationId])).rows[0]!.count, 0);
+
+    const clickSecond = Math.floor(Date.now() / 1000);
+    assert.deepEqual(await store.resumeConversation('instance-0', 'session-0', conversationId), { status: 'resumed' });
+    const resumed = (await f.pg.query<{ automation_started_at: Date; click_second: number }>(
+      `SELECT automation_started_at, floor(extract(epoch FROM automation_started_at))::int AS click_second
+       FROM conversations WHERE id = $1`, [conversationId])).rows[0]!;
+    assert.ok(new Date(resumed.automation_started_at).getMilliseconds() > 0,
+      'resume boundary must retain subsecond precision instead of rounding up');
+    assert.equal(resumed.click_second, clickSecond, 'resume must begin in the click second');
+
+    await f.addIncoming(0, 'same-second-after-resume', 'new message in resume second', store, clickSecond);
+    assert.equal((await f.pg.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM reply_jobs j JOIN messages m ON m.id = j.source_message_id
+       WHERE j.conversation_id = $1 AND m.provider_message_id = 'before-resume'`, [conversationId])).rows[0]!.count, 0,
+      'a message received before resume must never acquire a job');
+    assert.equal((await f.pg.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM reply_jobs WHERE conversation_id = $1 AND state = 'pending'", [conversationId])).rows[0]!.count, 1);
+    assert.equal(await store.processNext(f.sender), true);
+    assert.deepEqual(generated, ['new message in resume second']);
+    assert.equal(f.senderCalls[0]!.text, 'reply to new event');
+  } finally { await f.close(); }
+});
+
 test('company AI opt-out during generation cancels the generated reply without fixed fallback', async () => {
   const f = await fixture();
   let started!: () => void;

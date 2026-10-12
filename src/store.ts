@@ -106,7 +106,11 @@ export class Store {
         await tx.query(
           `INSERT INTO reply_jobs(id, organization_id, channel_id, conversation_id, source_message_id, epoch, body)
            SELECT $1, cv.organization_id, cv.channel_id, cv.id, $2, cv.automation_epoch, $3
-           FROM conversations cv WHERE cv.id = $4 AND cv.mode = 'auto'
+           FROM conversations cv JOIN messages m ON m.id = $2
+             AND m.organization_id = cv.organization_id AND m.channel_id = cv.channel_id
+             AND m.conversation_id = cv.id
+           WHERE cv.id = $4 AND cv.mode = 'auto'
+             AND m.received_at >= cv.automation_started_at
              AND $5 >= floor(extract(epoch FROM cv.automation_started_at))
              AND $5 >= extract(epoch FROM now()) - 120 AND $5 <= extract(epoch FROM now()) + 30
              AND NOT EXISTS (SELECT 1 FROM reply_jobs j WHERE j.conversation_id = cv.id
@@ -178,7 +182,7 @@ export class Store {
 
       await tx.query(`UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
           ai_handoff_reason = NULL, ai_handoff_at = NULL,
-          automation_started_at = GREATEST(to_timestamp(ceil(extract(epoch FROM now()))), $4),
+          automation_started_at = GREATEST(now(), $4),
           control_timestamp = GREATEST(control_timestamp, ceil(extract(epoch FROM now()))::bigint)
         WHERE id = $1 AND organization_id = $2 AND channel_id = $3 AND mode = 'human'`,
         [conversationId, scope.organization_id, scope.id, scope.automation_activated_at]);
@@ -290,7 +294,7 @@ export class Store {
       const resumed = await tx.query(
         `UPDATE conversations SET mode = 'auto', automation_epoch = automation_epoch + 1,
          ai_handoff_reason = NULL, ai_handoff_at = NULL,
-         automation_started_at = GREATEST(now(), to_timestamp($2 + 1)), control_timestamp = $2
+         automation_started_at = now(), control_timestamp = $2
          WHERE id = $1 AND mode IN ('human','monitoring') AND $2 > control_timestamp
          AND $2 >= extract(epoch FROM now()) - 120 AND $2 <= extract(epoch FROM now()) + 30
          RETURNING id`, [id, reaction.timestamp]);
@@ -369,6 +373,7 @@ export class Store {
            AND ((c.automation_scope = 'all' AND cv.chat_id ~ '^[0-9]+(@c[.]us|@s[.]whatsapp[.]net|@lid)$')
              OR (c.automation_scope = 'test' AND cv.chat_id = c.automation_test_chat_id))
            AND c.automation_activated_at IS NOT NULL
+           AND m.received_at >= cv.automation_started_at
            AND m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
            AND m.provider_timestamp >= ceil(extract(epoch FROM c.automation_activated_at))
            AND m.provider_timestamp >= extract(epoch FROM now()) - 120
@@ -467,7 +472,8 @@ export class Store {
       );
       const jobs = await tx.query<{ state: string; epoch: number; body: string; fresh: boolean }>(
         `SELECT j.state, j.epoch, j.body,
-          (m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
+          (m.received_at >= cv.automation_started_at
+            AND m.provider_timestamp >= floor(extract(epoch FROM cv.automation_started_at))
             AND c.automation_activated_at IS NOT NULL
             AND m.provider_timestamp >= ceil(extract(epoch FROM c.automation_activated_at))
             AND m.provider_timestamp >= extract(epoch FROM now()) - 120

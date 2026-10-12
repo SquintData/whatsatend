@@ -197,6 +197,12 @@ O cadastro inicial de empresa/canal continua pela CLI local depois de
 cria novos canais nesta fatia. Para vincular o webhook de uma nova empresa, use
 o token protegido criado no fluxo da CLI, nunca copie segredos para páginas/logs.
 
+No detalhe da conversa, `Retomar IA` libera somente mensagens recebidas depois
+do instante subsegundo da retomada; uma mensagem já recebida antes não ganha job.
+Como o timestamp WAHA tem precisão de segundos, um evento ocorrido antes do clique,
+mas entregue ao backend somente depois dentro do mesmo segundo, não pode ser
+ordenado com certeza em relação ao clique e ainda pode ser considerado novo.
+
 Crie uma empresa e seu canal com um arquivo JSON protegido fora do repositório:
 
 ```json
