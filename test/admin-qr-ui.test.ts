@@ -150,6 +150,7 @@ interface FakeElement {
   tagName: string;
   textContent: string;
   href: string;
+  dataset: Record<string, string>;
   children: FakeElement[];
   onclick?: (event: { preventDefault(): void }) => void;
   append(...nodes: FakeElement[]): void;
@@ -165,6 +166,7 @@ function fakeDocument(): FakeDocument {
       tagName: tag,
       textContent: '',
       href: '',
+      dataset: {},
       children: [],
       append(...nodes) { this.children.push(...nodes); },
       replaceChildren(...nodes) { this.children = [...nodes]; this.textContent = ''; },

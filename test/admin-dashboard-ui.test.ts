@@ -1,0 +1,228 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
+import { adminPage } from '../src/admin.js';
+
+const views = ['overview', 'companies', 'attention', 'conversations', 'usage'];
+
+function loadShowView() {
+  const start = adminPage.indexOf('function showView(view)');
+  const end = adminPage.indexOf('\nfunction ', start + 1);
+  assert.ok(start >= 0 && end > start, 'dashboard must define an isolated showView function');
+  const panels = views.map(view => ({ dataset: { viewPanel: view }, hidden: true }));
+  const navigation = views.map(view => {
+    const attributes = new Map<string, string>();
+    return { dataset: { viewNav: view }, attributes,
+      setAttribute(name: string, value: string) { attributes.set(name, value); },
+      removeAttribute(name: string) { attributes.delete(name); } };
+  });
+  const documentRef = { querySelectorAll(selector: string) {
+    if (selector === '[data-view-panel]') return panels;
+    if (selector === '[data-view-nav]') return navigation;
+    throw new Error(`unexpected selector ${selector}`);
+  } };
+  const showView = runInNewContext(`(()=>{${adminPage.slice(start, end)}; return showView;})()`,
+    { document: documentRef }) as (view: string) => boolean;
+  return { showView, panels, navigation };
+}
+
+function loadDashboardDataHelpers() {
+  const start = adminPage.indexOf('function dashboardMetrics(rows)');
+  const end = adminPage.indexOf('function showView(view)', start + 1);
+  assert.ok(start >= 0 && end > start, 'dashboard must expose its channel summary and safe row renderer');
+  return runInNewContext(`(()=>{${adminPage.slice(start, end)}; return {dashboardMetrics,filterDashboardChannels,renderDashboardCompanyRows};})()`, {}) as {
+    dashboardMetrics(rows: Array<Record<string, unknown>>): { channels: number; ready: number };
+    filterDashboardChannels(rows: Array<Record<string, unknown>>, query: string): Array<Record<string, unknown>>;
+    renderDashboardCompanyRows(rows: Array<Record<string, unknown>>, target: FakeElement,
+      open: (row: Record<string, unknown>) => void, documentRef: FakeDocument): void;
+  };
+}
+
+interface FakeElement {
+  textContent: string;
+  innerHTML?: string;
+  className: string;
+  children: FakeElement[];
+  onclick?: () => void;
+  append(...children: FakeElement[]): void;
+  replaceChildren(...children: FakeElement[]): void;
+}
+
+interface FakeDocument { createElement(tag: string): FakeElement & { tagName: string } }
+
+function fakeDocument(): FakeDocument {
+  return { createElement: tag => ({ tagName: tag, textContent: '', className: '', children: [],
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; } }) };
+}
+
+test('attention navigation selects conversations before loading and reveals the resulting detail', async () => {
+  const start = adminPage.indexOf('function openAttentionConversation(');
+  const end = adminPage.indexOf('\nfunction ', start + 1);
+  assert.ok(start >= 0 && end > start, 'attention navigation helper must route before loading detail');
+  const openAttentionConversation = runInNewContext('(()=>{' + adminPage.slice(start, end) + ';return openAttentionConversation})()') as
+    (item: unknown, navigate: (view: string) => void, load: (item: unknown) => Promise<void>) => Promise<void>;
+  const state = { view: 'attention', detailVisible: false };
+  await openAttentionConversation({ id: 'conversation-a' }, view => { state.view = view; }, async () => {
+    assert.equal(state.view, 'conversations');
+    await Promise.resolve();
+    state.detailVisible = true;
+  });
+  assert.equal(state.view, 'conversations');
+  assert.equal(state.detailVisible, true);
+});
+
+test('channel workspace loading prevents mapping mismatch and ignores stale responses after navigation', async () => {
+  const start = adminPage.indexOf('function createChannelWorkspaceLoader()');
+  const end = adminPage.indexOf('\nfunction showView(view)', start + 1);
+  assert.ok(start >= 0 && end > start, 'workspace loader must guard asynchronous channel selection');
+  const createLoader = runInNewContext('(()=>{' + adminPage.slice(start, end) + ';return createChannelWorkspaceLoader})()') as () => {
+    invalidate(): void;
+    load(instance: string, session: string, fetchChannel: (instance: string, session: string) => Promise<{ company: string; tone: string }>,
+      onLoading: () => void, onLoaded: (instance: string, session: string, value: { company: string; tone: string }) => void,
+      onError: () => void): Promise<boolean>;
+  };
+  const loader = createLoader();
+  const pending = new Map<string, (value: { company: string; tone: string }) => void>();
+  let selected: { instance: string; session: string } | null = null;
+  let form: { company: string; tone: string } | null = null;
+  let workspaceVisible = true;
+  let currentView = 'companies';
+  const load = (instance: string, session: string) => loader.load(instance, session,
+    (i, s) => new Promise(resolve => pending.set(i, resolve)),
+    () => { selected = null; form = null; workspaceVisible = false; },
+    (i, s, value) => { selected = { instance: i, session: s }; form = value; workspaceVisible = true; },
+    () => assert.fail('unexpected channel load failure'));
+
+  const requestA = load('instance-a', 'session-a');
+  assert.equal(workspaceVisible, false, 'old editable fields must disappear while a different channel loads');
+  const requestB = load('instance-b', 'session-b');
+  pending.get('instance-b')!({ company: 'Company B', tone: 'tone-b' });
+  assert.equal(await requestB, true);
+  pending.get('instance-a')!({ company: 'Company A', tone: 'tone-a' });
+  assert.equal(await requestA, false);
+  assert.deepEqual(selected, { instance: 'instance-b', session: 'session-b' });
+  assert.deepEqual(form, { company: 'Company B', tone: 'tone-b' });
+  const savePayload = { ...selected!, ...form! };
+  assert.equal(savePayload.instance, 'instance-b');
+  assert.equal(savePayload.tone, 'tone-b', 'a delayed A response cannot be saved under B mapping');
+
+  const requestC = load('instance-c', 'session-c');
+  currentView = 'attention';
+  loader.invalidate();
+  pending.get('instance-c')!({ company: 'Company C', tone: 'tone-c' });
+  assert.equal(await requestC, false, 'navigation must invalidate an outstanding channel request');
+  assert.equal(workspaceVisible, false);
+  assert.equal(currentView, 'attention', 'an obsolete response cannot reopen the workspace after navigation');
+  assert.equal(selected, null, 'a cancelled loading state has no save mapping');
+});
+
+test('real channel open wiring navigates, fetches, fills the form, and still cancels on later navigation', async () => {
+  const sourceBetween = (startMarker: string, endMarker: string) => {
+    const start = adminPage.indexOf(startMarker);
+    const end = adminPage.indexOf(endMarker, start + 1);
+    assert.ok(start >= 0 && end > start, `dashboard source must contain ${startMarker}`);
+    return adminPage.slice(start, end);
+  };
+  const loaderSource = sourceBetween('function createChannelWorkspaceLoader()', '\nfunction openAttentionConversation(');
+  const viewSource = sourceBetween('function showView(view)', '\nfunction createQrView(');
+  const navigationSource = sourceBetween('function navigateToView(view', "\ndocument.querySelectorAll('[data-view-nav]')");
+  const cancellationSource = sourceBetween('function cancelChannelLoad()', '\nfunction showCompanyList()');
+  const openSource = sourceBetween('const open=(instance,session)=>channelWorkspaceLoader', '\nlet connectionQr');
+  const panels = views.map(view => ({ dataset: { viewPanel: view }, hidden: true }));
+  const navigation = views.map(view => ({ dataset: { viewNav: view }, setAttribute() {}, removeAttribute() {} }));
+  const elements = new Map<string, { hidden: boolean; textContent: string; value: string; checked: boolean }>(
+    ['#page-title', '#company-load-status', '#table', '#company-list-panel', '#company-create-panel', '#editor',
+      '#title', '#enabled', '#model', '#data', '#tone', '#instructions', '#scope-value', '#test-chat']
+      .map(selector => [selector, { hidden: false, textContent: '', value: '', checked: false }]));
+  const documentRef = {
+    querySelectorAll(selector: string) {
+      if (selector === '[data-view-panel]') return panels;
+      if (selector === '[data-view-nav]') return navigation;
+      throw new Error(`unexpected querySelectorAll: ${selector}`);
+    },
+    querySelector(selector: string) {
+      const element = elements.get(selector);
+      assert.ok(element, `unexpected selector: ${selector}`);
+      return element;
+    },
+  };
+  const pending = new Map<string, (value: unknown) => void>();
+  const script = `(()=>{${loaderSource}${viewSource}
+    let selected=null,channelLoadPending=false;
+    const channelWorkspaceLoader=createChannelWorkspaceLoader();
+    function cancelChannelLoad(){${cancellationSource.slice(cancellationSource.indexOf('{') + 1, -1)}}
+    function navigateToView(view,preserveChannelLoad=false){${navigationSource.slice(navigationSource.indexOf('{') + 1, -1)}}
+    function activateCompanyTab(){}
+    function notice(){}
+    ${openSource}
+    return {open,navigateToView,state:()=>({selected,channelLoadPending})};
+  })()`;
+  const dashboard = runInNewContext(script, {
+    document: documentRef,
+    URLSearchParams,
+    api: (url: string) => new Promise(resolve => pending.set(new URLSearchParams(url.split('?')[1]).get('session')!, resolve)),
+  }) as {
+    open(instance: string, session: string): Promise<boolean>;
+    navigateToView(view: string): boolean;
+    state(): { selected: { instance: string; session: string } | null; channelLoadPending: boolean };
+  };
+  const response = { company: 'Company A', ai: { enabled: true, model: 'model-a', businessData: { name: 'A' }, tone: 'tone-a', instructions: 'instructions-a' },
+    scope: 'test', testChatId: 'chat-a' };
+  const opening = dashboard.open('instance-a', 'session-a');
+  assert.equal(panels.find(panel => panel.dataset.viewPanel === 'companies')?.hidden, false,
+    'open() navigates to the visible companies view while loading');
+  assert.equal(elements.get('#editor')?.hidden, true, 'the old workspace remains hidden during loading');
+  assert.equal(dashboard.state().channelLoadPending, true);
+  pending.get('session-a')!(response);
+  assert.equal(await opening, true, 'the request started by open() must remain current after its own navigation');
+  assert.equal(dashboard.state().selected?.instance, 'instance-a');
+  assert.equal(dashboard.state().selected?.session, 'session-a');
+  assert.equal(elements.get('#editor')?.hidden, false);
+  assert.equal(elements.get('#model')?.value, 'model-a');
+  assert.equal(elements.get('#tone')?.value, 'tone-a');
+
+  const staleOpening = dashboard.open('instance-b', 'session-b');
+  dashboard.navigateToView('attention');
+  pending.get('session-b')!(response);
+  assert.equal(await staleOpening, false, 'manual navigation still invalidates a pending open');
+  assert.equal(panels.find(panel => panel.dataset.viewPanel === 'attention')?.hidden, false);
+  assert.equal(elements.get('#editor')?.hidden, true, 'a stale response cannot reopen the old workspace');
+  assert.equal(dashboard.state().selected, null);
+});
+
+test('dashboard navigation exposes one requested view and marks its link as current', () => {
+  const { showView, panels, navigation } = loadShowView();
+  for (const selected of views) {
+    assert.equal(showView(selected), true);
+    assert.deepEqual(panels.filter(panel => !panel.hidden).map(panel => panel.dataset.viewPanel), [selected]);
+    assert.deepEqual(navigation.filter(item => item.attributes.get('aria-current') === 'page')
+      .map(item => item.dataset.viewNav), [selected]);
+  }
+  assert.equal(showView('unknown'), false);
+  assert.equal(panels.filter(panel => !panel.hidden).length, 1, 'an invalid route must not expose another view');
+});
+
+test('overview counts channels, identifies only eligible ones, filters by company or channel and renders text safely', () => {
+  const { dashboardMetrics, filterDashboardChannels, renderDashboardCompanyRows } = loadDashboardDataHelpers();
+  const rows = [
+    { company: 'Same name', instance: 'west', session: 'one', organizationActive: true, channelActive: true, aiEnabled: true, scope: 'test' },
+    { company: 'Same name', instance: 'east', session: 'two', organizationActive: true, channelActive: true, aiEnabled: false, scope: 'all' },
+    { company: 'Paused org', instance: 'west', session: 'three', organizationActive: false, channelActive: true, aiEnabled: true, scope: 'all' },
+    { company: 'Paused channel', instance: 'west', session: 'four', organizationActive: true, channelActive: false, aiEnabled: true, scope: 'all' },
+    { company: 'Disabled scope', instance: 'west', session: 'five', organizationActive: true, channelActive: true, aiEnabled: true, scope: 'disabled' },
+  ];
+  const metrics = dashboardMetrics(rows);
+  assert.equal(metrics.channels, 5, 'channel totals include same-name channels independently');
+  assert.equal(metrics.ready, 1);
+  assert.deepEqual(Array.from(filterDashboardChannels(rows, 'TWO'), row => row.session), ['two']);
+  assert.deepEqual(Array.from(filterDashboardChannels(rows, 'same name'), row => row.session), ['one', 'two']);
+
+  const documentRef = fakeDocument();
+  const target = documentRef.createElement('div');
+  const malicious = { ...rows[0]!, company: '<img src=x onerror=alert(1)>' };
+  renderDashboardCompanyRows([malicious], target, () => {}, documentRef);
+  const title = target.children[0]!.children[0]!.children[0]!;
+  assert.equal(title.textContent, malicious.company);
+  assert.equal(title.innerHTML, undefined, 'untrusted company names are plain text, never parsed as HTML');
+});
