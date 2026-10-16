@@ -43,9 +43,9 @@ export class Store {
       // lock during a bounded send also serializes an echo arriving before its ID.
       const activeChannel = await tx.query<{
         id: string; active: boolean; organization_active: boolean; instance: string; session: string;
-        automation_scope: 'disabled' | 'test' | 'all'; automation_test_chat_id: string | null; automation_activated_at: Date | null;
+        ai_enabled: boolean; automation_scope: 'disabled' | 'test' | 'all'; automation_test_chat_id: string | null; automation_activated_at: Date | null;
       }>(`SELECT c.id, c.active, o.active AS organization_active, c.instance, c.session,
-          c.automation_scope, c.automation_test_chat_id, c.automation_activated_at
+          o.ai_enabled, c.automation_scope, c.automation_test_chat_id, c.automation_activated_at
         FROM channels c JOIN organizations o ON o.id = c.organization_id
         WHERE c.id = $1 AND c.organization_id = $2 FOR UPDATE OF c, o`,
         [channel.id, channel.organization_id]);
@@ -56,6 +56,7 @@ export class Store {
       const recent = timestamp !== undefined && timestamp >= now - 120 && timestamp <= now + 30;
       const activatedAt = scope.automation_activated_at ? Math.ceil(new Date(scope.automation_activated_at).getTime() / 1000) : Number.POSITIVE_INFINITY;
       const eligible = this.automation.enabled && !message.fromMe && recent && timestamp! >= activatedAt
+        && (scope.automation_scope !== 'all' || scope.ai_enabled)
         && channelChatAllowed(scope.automation_scope, scope.automation_test_chat_id, chatId);
       if (message.fromMe) {
         const own = await tx.query(
@@ -363,9 +364,10 @@ export class Store {
   async processNext(sender: Sender): Promise<boolean> {
     const settings = this.automation;
     if (!settings.enabled) return false;
-    const claimed = await this.db.query<{ id: string; organization_id: string; channel_id: string; conversation_id: string; epoch: number; ai_enabled: boolean }>(
+    const claimed = await this.db.query<{ id: string; organization_id: string; channel_id: string; conversation_id: string; epoch: number; ai_enabled: boolean; blocked: boolean }>(
       `WITH candidate AS (
-         SELECT j.id, o.ai_enabled FROM reply_jobs j JOIN channels c ON c.id = j.channel_id
+         SELECT j.id, o.ai_enabled, (c.automation_scope = 'all' AND NOT o.ai_enabled) AS blocked
+         FROM reply_jobs j JOIN channels c ON c.id = j.channel_id
          JOIN organizations o ON o.id = j.organization_id
          JOIN conversations cv ON cv.id = j.conversation_id
          JOIN messages m ON m.id = j.source_message_id AND m.organization_id = j.organization_id
@@ -381,12 +383,15 @@ export class Store {
            AND m.provider_timestamp >= extract(epoch FROM now()) - 120
            AND m.provider_timestamp <= extract(epoch FROM now()) + 30
          ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED
-       ) UPDATE reply_jobs j SET state = CASE WHEN candidate.ai_enabled THEN 'generating' ELSE 'sending' END,
-         claimed_at = now() FROM candidate WHERE j.id = candidate.id
-         RETURNING j.id, j.organization_id, j.channel_id, j.conversation_id, j.epoch, candidate.ai_enabled`,
+       ) UPDATE reply_jobs j SET state = CASE WHEN candidate.blocked THEN 'cancelled'
+           WHEN candidate.ai_enabled THEN 'generating' ELSE 'sending' END,
+         claimed_at = now(), completed_at = CASE WHEN candidate.blocked THEN now() ELSE j.completed_at END
+         FROM candidate WHERE j.id = candidate.id
+         RETURNING j.id, j.organization_id, j.channel_id, j.conversation_id, j.epoch, candidate.ai_enabled, candidate.blocked`,
     );
     const job = claimed.rows[0];
     if (!job) return false;
+    if (job.blocked) return true;
 
     let aiDecision: AIDecision | undefined;
     let aiModel: string | undefined;
@@ -493,6 +498,7 @@ export class Store {
       if (!channel.active || !organization.rows[0]?.active || conversation.mode !== 'auto'
         || conversation.automation_epoch !== current.epoch || current.epoch !== job.epoch || !current.fresh
         || !channelChatAllowed(channel.automation_scope, channel.automation_test_chat_id, conversation.chat_id)
+        || (channel.automation_scope === 'all' && !organization.rows[0].ai_enabled)
         || (aiDecision !== undefined && !organization.rows[0].ai_enabled)) {
         await tx.query("UPDATE reply_jobs SET state = 'cancelled', completed_at = now() WHERE id = $1", [job.id]);
         return;

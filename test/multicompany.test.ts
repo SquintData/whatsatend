@@ -149,7 +149,7 @@ test('administrative disable cancels queued work and clears auto mode for the ch
 });
 
 test('worker claim and final send reject a source timestamp in the activation second', async () => {
-  const f = await fixture([{ scope: 'all' }, { scope: 'all' }]);
+  const f = await fixture([{ scope: 'test', testChatId: chats[0] }, { scope: 'test', testChatId: chats[1] }]);
   try {
     const sourceSecond = Math.floor(Date.now() / 1000);
     await f.pg.query('UPDATE organizations SET ai_enabled = false');

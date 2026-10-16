@@ -278,6 +278,30 @@ test('company AI opt-out keeps the fixed reply path and does not call the provid
   } finally { await f.close(); }
 });
 
+test('legacy all-contact scope with AI disabled neither enqueues nor sends a fixed reply', async () => {
+  const f = await fixture([false, true]);
+  const provider: AIProvider = { async generate() { throw new Error('unexpected provider call'); } };
+  try {
+    const store = f.storeFor(0, provider);
+    await f.pg.query("UPDATE channels SET automation_scope = 'all', automation_test_chat_id = NULL WHERE id = $1", [f.channels[0]]);
+    await f.addIncoming(0, 'legacy-all-incoming', 'hello', store);
+    assert.equal((await f.pg.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM reply_jobs WHERE channel_id = $1', [f.channels[0]])).rows[0]!.count, 0);
+    assert.equal(await store.processNext(f.sender), false);
+    assert.equal(f.senderCalls.length, 0);
+
+    await f.pg.query('UPDATE organizations SET ai_enabled = true WHERE id = $1', [f.organizations[0]]);
+    await f.addIncoming(0, 'pending-before-opt-out', 'new question', store);
+    assert.equal((await f.pg.query<{ state: string }>(
+      "SELECT state FROM reply_jobs WHERE source_message_id IN (SELECT id FROM messages WHERE provider_message_id = 'pending-before-opt-out')")).rows[0]!.state, 'pending');
+    await f.pg.query('UPDATE organizations SET ai_enabled = false WHERE id = $1', [f.organizations[0]]);
+    assert.equal(await store.processNext(f.sender), true);
+    assert.equal(f.senderCalls.length, 0);
+    assert.equal((await f.pg.query<{ state: string }>(
+      "SELECT state FROM reply_jobs WHERE source_message_id IN (SELECT id FROM messages WHERE provider_message_id = 'pending-before-opt-out')")).rows[0]!.state, 'cancelled');
+  } finally { await f.close(); }
+});
+
 test('OpenAI provider uses Responses structured output with storage disabled', async () => {
   let requestUrl = '';
   let requestInit: RequestInit | undefined;
