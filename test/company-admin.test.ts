@@ -72,6 +72,32 @@ test('operator onboarding creates isolated company/channel defaults, configures 
   } finally { await f.pg.close(); }
 });
 
+test('all-contact scope requires AI while test scope keeps the fixed-reply pilot', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({
+      name: 'Empresa', instance: 'principal', session: 'empresa', webhookToken: 'd'.repeat(64),
+    })));
+    await setChannelScope(f.db, 'principal', 'empresa', 'test', '5511999999999@c.us');
+    await assert.rejects(setChannelScope(f.db, 'principal', 'empresa', 'all'), /AI must be enabled for all-contact automation/);
+    assert.equal((await f.pg.query<{ automation_scope: string }>('SELECT automation_scope FROM channels WHERE session = $1', ['empresa'])).rows[0]!.automation_scope, 'test');
+    await setChannelScope(f.db, 'principal', 'empresa', 'disabled');
+    await configureCompanyAI(f.db, 'principal', 'empresa', parseCompanyAIConfig(JSON.stringify({
+      enabled: true, model: 'gpt-4o-mini', businessData: {}, tone: '', instructions: '',
+    })));
+    await setChannelScope(f.db, 'principal', 'empresa', 'all');
+    await assert.rejects(configureCompanyAI(f.db, 'principal', 'empresa', parseCompanyAIConfig(JSON.stringify({
+      enabled: false, model: 'gpt-4o-mini', businessData: {}, tone: '', instructions: '',
+    }))), /AI must be enabled for all-contact automation/);
+    assert.equal((await f.pg.query<{ ai_enabled: boolean }>('SELECT ai_enabled FROM organizations')).rows[0]!.ai_enabled, true);
+    await setChannelScope(f.db, 'principal', 'empresa', 'disabled');
+    await configureCompanyAI(f.db, 'principal', 'empresa', parseCompanyAIConfig(JSON.stringify({
+      enabled: false, model: 'gpt-4o-mini', businessData: {}, tone: '', instructions: '',
+    })));
+    assert.equal((await f.pg.query<{ ai_enabled: boolean }>('SELECT ai_enabled FROM organizations')).rows[0]!.ai_enabled, false);
+  } finally { await f.pg.close(); }
+});
+
 test('global WAHA session migration fails explicitly without changing preexisting duplicate mappings', async () => {
   const pg = new PGlite();
   try {
