@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { Connection, Database } from './db.js';
 import { parseCompanyAIConfig, type CompanyAIConfig } from './ai-config.js';
-import { setChannelScope, type ChannelScope } from './channel-scope.js';
+import { AllScopeRequiresAIError, setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
 import { listCompanies, configureCompanyAI, insertCompany, parseCompanyOnboarding } from './company-admin.js';
 import type { WahaAdminClient } from './waha-admin.js';
@@ -386,7 +386,10 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
       businessData: body.data.businessData, tone: body.data.tone, instructions: body.data.instructions })); }
     catch { return reject(reply, 400); }
     try { await configureCompanyAI(db, body.data.instance, body.data.session, config); return { ok: true }; }
-    catch { return reject(reply, 400); }
+    catch (error) {
+      if (error instanceof AllScopeRequiresAIError) return reply.code(409).send({ error: 'all_scope_requires_ai' });
+      return reject(reply, 400);
+    }
   });
   app.put('/admin/api/channel/scope', async (request, reply) => {
     headers(reply); if (!guard(request, reply)) return;
@@ -404,6 +407,9 @@ export function registerAdminPanel(app: FastifyInstance, db: Database, secret: s
       }
       await setChannelScope(db, parsed.data.instance, parsed.data.session, parsed.data.scope, parsed.data.testChatId);
       return { ok: true };
-    } catch { return reject(reply, 400); }
+    } catch (error) {
+      if (error instanceof AllScopeRequiresAIError) return reply.code(409).send({ error: 'ai_not_enabled' });
+      return reject(reply, 400);
+    }
   });
 }

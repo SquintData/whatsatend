@@ -16,6 +16,39 @@ const enabledAutomation: Automation = {
   enabled: true, instance: '', session: '', chatId: '', wahaUrl: 'http://waha.local', apiKey: 'test-key-'.padEnd(40, 'x'),
 };
 
+test('admin API preserves test pilot but rejects all contacts without AI and rejects disabling AI while all is active', async () => {
+  const f = await fixture();
+  try {
+    await createCompany(f.db, parseCompanyOnboarding(JSON.stringify({
+      name: 'Empresa', instance: 'principal', session: 'empresa', webhookToken: 'd'.repeat(64),
+    })));
+    const originHeaders = { host: 'admin.test', origin: 'https://admin.test' };
+    const login = await f.app.inject({ method: 'POST', url: '/admin/api/login', headers: originHeaders,
+      payload: { secret: 'admin-secret-'.padEnd(40, 'x') } });
+    assert.equal(login.statusCode, 204);
+    const headers = { ...originHeaders, cookie: String(login.headers['set-cookie']).split(';')[0]!, 'x-admin-action': '1' };
+    const testScope = await f.app.inject({ method: 'PUT', url: '/admin/api/channel/scope', headers,
+      payload: { instance: 'principal', session: 'empresa', scope: 'test', testChatId: '5511999999999@c.us' } });
+    assert.equal(testScope.statusCode, 200);
+    const response = await f.app.inject({ method: 'PUT', url: '/admin/api/channel/scope', headers,
+      payload: { instance: 'principal', session: 'empresa', scope: 'all', confirmAll: true } });
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(response.json(), { error: 'ai_not_enabled' });
+    assert.equal((await f.pg.query<{ automation_scope: string }>('SELECT automation_scope FROM channels WHERE session = $1', ['empresa'])).rows[0]!.automation_scope, 'test');
+    const aiPayload = { instance: 'principal', session: 'empresa', model: 'gpt-4o-mini',
+      businessData: {}, tone: '', instructions: '' };
+    assert.equal((await f.app.inject({ method: 'PUT', url: '/admin/api/channel/ai', headers,
+      payload: { ...aiPayload, enabled: true } })).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'PUT', url: '/admin/api/channel/scope', headers,
+      payload: { instance: 'principal', session: 'empresa', scope: 'all', confirmAll: true } })).statusCode, 200);
+    const disableAI = await f.app.inject({ method: 'PUT', url: '/admin/api/channel/ai', headers,
+      payload: { ...aiPayload, enabled: false } });
+    assert.equal(disableAI.statusCode, 409);
+    assert.deepEqual(disableAI.json(), { error: 'all_scope_requires_ai' });
+    assert.equal((await f.pg.query<{ ai_enabled: boolean }>('SELECT ai_enabled FROM organizations')).rows[0]!.ai_enabled, true);
+  } finally { await f.close(); }
+});
+
 function frontendApi(fetcher: (url: string, options: { method?: string; headers: Record<string, string>; body?: string }) => unknown) {
   const start = adminPage.indexOf('async function api');
   const end = adminPage.indexOf('\nfunction notice', start);

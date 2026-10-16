@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { createDatabase, type Connection, type Database } from './db.js';
 import { parseCompanyAIConfig, type CompanyAIConfig } from './ai-config.js';
-import { setChannelScope, type ChannelScope } from './channel-scope.js';
+import { AllScopeRequiresAIError, setChannelScope, type ChannelScope } from './channel-scope.js';
 import { directChat } from './automation.js';
 import { tokenHash } from './store.js';
 
@@ -70,6 +70,11 @@ export async function configureCompanyAI(
        WHERE c.instance = $1 AND c.session = $2 FOR UPDATE OF c, o`, [instance, session]);
     const organizationId = channel.rows[0]?.organization_id;
     if (!organizationId) throw new Error('Channel not found');
+    if (!config.enabled) {
+      const allScope = await tx.query<{ id: string }>(
+        `SELECT id FROM channels WHERE organization_id = $1 AND automation_scope = 'all' LIMIT 1`, [organizationId]);
+      if (allScope.rows.length) throw new AllScopeRequiresAIError();
+    }
     await tx.query(
       `UPDATE organizations SET ai_enabled = $2, ai_model = $3, ai_business_data = $4,
        ai_tone = $5, ai_instructions = $6 WHERE id = $1`,
@@ -142,6 +147,7 @@ async function main() {
   } catch (error) {
     const message = error instanceof Error && error.message.startsWith('Usage:') ? error.message
       : error instanceof Error && /requires|takes no extra|exact direct chat|WAHA session is already/.test(error.message) ? error.message
+      : error instanceof AllScopeRequiresAIError ? error.message
       : 'Company administration failed; check input, channel mapping and database migration';
     console.error(message);
     process.exitCode = 1;

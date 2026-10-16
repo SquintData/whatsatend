@@ -5,15 +5,21 @@ import { directChat } from './automation.js';
 
 export type ChannelScope = 'disabled' | 'test' | 'all';
 
+export class AllScopeRequiresAIError extends Error {
+  constructor() { super('AI must be enabled for all-contact automation'); }
+}
+
 export async function setChannelScope(
   db: Database, instance: string, session: string, scope: ChannelScope, testChatId?: string,
 ): Promise<void> {
   if (scope === 'test' && (!testChatId || !directChat(testChatId))) throw new Error('test scope requires an exact direct chat ID');
   if (scope !== 'test' && testChatId) throw new Error('chat ID is only valid for test scope');
   await db.transaction(async tx => {
-    const channel = await tx.query<{ id: string }>(
-      'SELECT id FROM channels WHERE instance = $1 AND session = $2 FOR UPDATE', [instance, session]);
+    const channel = await tx.query<{ id: string; ai_enabled: boolean }>(
+      `SELECT c.id, o.ai_enabled FROM channels c JOIN organizations o ON o.id = c.organization_id
+       WHERE c.instance = $1 AND c.session = $2 FOR UPDATE OF c, o`, [instance, session]);
     if (!channel.rows[0]) throw new Error('Channel not found');
+    if (scope === 'all' && !channel.rows[0].ai_enabled) throw new AllScopeRequiresAIError();
     const id = channel.rows[0].id;
     await tx.query(`UPDATE channels SET automation_scope = $2, automation_test_chat_id = $3,
       automation_activated_at = CASE WHEN $2 = 'disabled' THEN NULL ELSE now() END WHERE id = $1`,
@@ -63,8 +69,9 @@ async function main() {
   try {
     await setChannelScope(db, args.instance, args.session, args.scope, args.chatId);
     console.log(`Channel automation scope set to ${args.scope}; configuration values omitted`);
-  } catch {
-    console.error('Channel scope update failed; check instance/session and database migration');
+  } catch (error) {
+    console.error(error instanceof AllScopeRequiresAIError ? error.message
+      : 'Channel scope update failed; check instance/session and database migration');
     process.exitCode = 1;
   } finally { await close(); }
 }
